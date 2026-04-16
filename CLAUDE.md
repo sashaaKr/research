@@ -2,8 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-This repository is currently empty. Once code is added, update this file with:
+## Repository Structure
 
-- Build, lint, and test commands (including how to run a single test)
-- High-level architecture overview: major components, how they connect, and key data flows
-- Any non-obvious conventions or constraints specific to this codebase
+This is a research monorepo. Each top-level folder is an independent project exploring a specific technology, problem, or idea. Projects are self-contained and may use entirely different languages, frameworks, and tooling from one another.
+
+## Working in This Repo
+
+- Treat each subfolder as its own isolated project. Check for a local README, package.json, Makefile, pyproject.toml, Cargo.toml, or equivalent before running any commands.
+- Build, test, and lint commands vary per project — always discover them from the project's own config files rather than assuming.
+- When adding a new research project, create a new top-level folder. Include a README.md in it describing the goal, the technology being explored, and how to run it.
+- There is no shared dependency management or build system across projects.
