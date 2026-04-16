@@ -1,0 +1,4 @@
+# Temporal Python SDK
+# Docs: https://python.temporal.io
+# Samples: https://github.com/temporalio/samples-python
+temporalio>=1.7.0
