@@ -59,9 +59,7 @@ docker compose up -d
 
 ```bash
 cd temporal-research
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+uv sync               # creates .venv and installs dependencies from pyproject.toml
 ```
 
 ## Running each example
@@ -71,8 +69,15 @@ Each example is self-contained. Open two terminals inside the example directory:
 ```bash
 # Terminal 1 — start the worker
 cd temporal-research/01_hello_world
-python worker.py
+uv run python worker.py
 
 # Terminal 2 — start a workflow execution
-python starter.py
+uv run python starter.py
+```
+
+Or activate the venv once and drop the `uv run` prefix:
+
+```bash
+source ../.venv/bin/activate
+python worker.py
 ```
