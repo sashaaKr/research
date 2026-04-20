@@ -3,7 +3,7 @@ from datetime import timedelta
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 
-with workflow.unsafe.imports_allowed():
+with workflow.unsafe.imports_passed_through():
     from activities import flaky_service_call, validate_business_rule, long_running_task
 
 

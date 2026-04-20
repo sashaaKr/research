@@ -5,7 +5,7 @@ from temporalio import workflow
 # Guard the activity import so the workflow sandbox doesn't execute it at
 # import time. Workflows run in a restricted environment to enforce
 # determinism — this pattern lets you import normal Python code safely.
-with workflow.unsafe.imports_allowed():
+with workflow.unsafe.imports_passed_through():
     from activities import say_hello
 
 

@@ -5,7 +5,7 @@ from typing import Optional
 from temporalio import workflow
 from temporalio.exceptions import ApplicationError
 
-with workflow.unsafe.imports_allowed():
+with workflow.unsafe.imports_passed_through():
     from activities import (
         provision_cache,
         provision_database,

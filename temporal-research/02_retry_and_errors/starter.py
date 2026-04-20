@@ -7,8 +7,7 @@ Usage:
 import asyncio
 import sys
 
-from temporalio.client import Client
-from temporalio.exceptions import WorkflowFailureError
+from temporalio.client import Client, WorkflowFailureError
 
 from workflows import RetryDemoWorkflow
 

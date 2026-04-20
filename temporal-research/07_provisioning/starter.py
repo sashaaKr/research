@@ -16,8 +16,7 @@ import dataclasses
 import json
 import sys
 
-from temporalio.client import Client
-from temporalio.exceptions import WorkflowFailureError
+from temporalio.client import Client, WorkflowFailureError
 
 from models import ProvisioningRequest
 from workflows import EnvironmentProvisioningWorkflow

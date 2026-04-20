@@ -4,7 +4,7 @@ from typing import Optional
 
 from temporalio import workflow
 
-with workflow.unsafe.imports_allowed():
+with workflow.unsafe.imports_passed_through():
     from activities import close_ticket, escalate_to_manager, send_reminder
 
 
