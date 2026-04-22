@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal-activities
+  namespace: temporal-workers
+  labels:
+    app: temporal-activities
+    worker-type: activities
+spec:
+  replicas: 2    # matches HPA minReplicas
+  selector:
+    matchLabels:
+      app: temporal-activities
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 2
+  template:
+    metadata:
+      labels:
+        app: temporal-activities
+        worker-type: activities
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: worker
+          image: temporal-worker:local
+          imagePullPolicy: Never
+          env:
+            - name: WORKER_TYPE
+              value: "activities"
+            - name: TASK_QUEUE
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: ACTIVITY_TASK_QUEUE
+            - name: TEMPORAL_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: TEMPORAL_HOST
+            - name: TEMPORAL_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: TEMPORAL_NAMESPACE
+            - name: MAX_CONCURRENT_ACTIVITIES
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: ACTIVITIES_MAX_CONCURRENT_ACTIVITIES
+            - name: GRACEFUL_SHUTDOWN_SECS
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: GRACEFUL_SHUTDOWN_SECS
+          resources:
+            requests:
+              cpu:    "100m"
+              memory: "128Mi"
+            limits:
+              cpu:    "500m"
+              memory: "256Mi"
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import sys; sys.exit(0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: temporal-activities

@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal-orchestrator
+  namespace: temporal-workers
+  labels:
+    app: temporal-orchestrator
+    worker-type: orchestrator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: temporal-orchestrator
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: temporal-orchestrator
+        worker-type: orchestrator
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: worker
+          image: temporal-worker:local
+          imagePullPolicy: Never    # image was loaded with "kind load docker-image"
+          env:
+            - name: WORKER_TYPE
+              value: "orchestrator"
+            - name: TASK_QUEUE
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: ORCHESTRATOR_TASK_QUEUE
+            - name: ACTIVITY_TASK_QUEUE
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: ACTIVITY_TASK_QUEUE
+            - name: TEMPORAL_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: TEMPORAL_HOST
+            - name: TEMPORAL_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: TEMPORAL_NAMESPACE
+            - name: MAX_CONCURRENT_WORKFLOW_TASKS
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: ORCHESTRATOR_MAX_CONCURRENT_WORKFLOW_TASKS
+            - name: GRACEFUL_SHUTDOWN_SECS
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: GRACEFUL_SHUTDOWN_SECS
+          resources:
+            requests:
+              cpu:    "50m"
+              memory: "64Mi"
+            limits:
+              cpu:    "200m"
+              memory: "128Mi"
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import sys; sys.exit(0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      # One replica per node — mirrors production topology spread behaviour
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: temporal-orchestrator

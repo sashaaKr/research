@@ -47,4 +47,5 @@ services:
 
 networks:
   temporal-net:
+    name: temporal-net     # explicit name so Kind nodes can join it by this name
     driver: bridge

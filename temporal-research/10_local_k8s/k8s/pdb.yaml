@@ -1,0 +1,23 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: temporal-orchestrator-pdb
+  namespace: temporal-workers
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: temporal-orchestrator
+
+---
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: temporal-activities-pdb
+  namespace: temporal-workers
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: temporal-activities
