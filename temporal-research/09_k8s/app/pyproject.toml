@@ -1,0 +1,8 @@
+[project]
+name = "temporal-k8s-worker"
+version = "0.1.0"
+description = "Temporal workers — K8s deployment example"
+requires-python = ">=3.12"
+dependencies = [
+    "temporalio>=1.7.0",
+]
