@@ -1,10 +1,12 @@
-package main
+package server
 
 import (
 	"context"
 	"errors"
 	"log/slog"
 	"net/http"
+
+	"github.com/sashaakr/research/golang-http-service/internal/store"
 )
 
 func handleHealthz() http.Handler {
@@ -13,26 +15,26 @@ func handleHealthz() http.Handler {
 	})
 }
 
-func handleListWidgets(logger *slog.Logger, store Store) http.Handler {
+func handleListWidgets(logger *slog.Logger, widgets store.Store) http.Handler {
 	type response struct {
-		Widgets []Widget `json:"widgets"`
+		Widgets []store.Widget `json:"widgets"`
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		widgets, err := store.List(r.Context())
+		items, err := widgets.List(r.Context())
 		if err != nil {
 			logger.Error("list widgets", "err", err)
 			http.Error(w, "list failed", http.StatusInternalServerError)
 			return
 		}
-		_ = encode(w, http.StatusOK, response{Widgets: widgets})
+		_ = encode(w, http.StatusOK, response{Widgets: items})
 	})
 }
 
-func handleGetWidget(logger *slog.Logger, store Store) http.Handler {
+func handleGetWidget(logger *slog.Logger, widgets store.Store) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		widget, err := store.Get(r.Context(), id)
-		if errors.Is(err, ErrNotFound) {
+		widget, err := widgets.Get(r.Context(), id)
+		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "widget not found", http.StatusNotFound)
 			return
 		}
@@ -61,9 +63,9 @@ func (r createWidgetRequest) Valid(_ context.Context) map[string]string {
 	return problems
 }
 
-func handleCreateWidget(logger *slog.Logger, store Store) http.Handler {
+func handleCreateWidget(logger *slog.Logger, widgets store.Store) http.Handler {
 	type response struct {
-		Widget   Widget            `json:"widget,omitempty"`
+		Widget   store.Widget      `json:"widget,omitempty"`
 		Problems map[string]string `json:"problems,omitempty"`
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -76,7 +78,7 @@ func handleCreateWidget(logger *slog.Logger, store Store) http.Handler {
 			http.Error(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
-		created, err := store.Create(r.Context(), Widget{Name: req.Name, Price: req.Price})
+		created, err := widgets.Create(r.Context(), store.Widget{Name: req.Name, Price: req.Price})
 		if err != nil {
 			logger.Error("create widget", "err", err)
 			http.Error(w, "create failed", http.StatusInternalServerError)

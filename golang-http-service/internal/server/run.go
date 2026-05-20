@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"context"
@@ -11,9 +11,11 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/sashaakr/research/golang-http-service/internal/store"
 )
 
-func run(
+func Run(
 	ctx context.Context,
 	args []string,
 	getenv func(string) string,
@@ -37,9 +39,9 @@ func run(
 		Host: *host,
 		Port: *port,
 	}
-	store := NewMemoryStore()
+	widgets := store.NewMemoryStore()
 
-	srv := NewServer(logger, cfg, store)
+	srv := NewServer(logger, cfg, widgets)
 	httpServer := &http.Server{
 		Addr:              net.JoinHostPort(cfg.Host, cfg.Port),
 		Handler:           srv,

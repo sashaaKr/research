@@ -1,8 +1,10 @@
-package main
+package server
 
 import (
 	"log/slog"
 	"net/http"
+
+	"github.com/sashaakr/research/golang-http-service/internal/store"
 )
 
 type Config struct {
@@ -11,15 +13,14 @@ type Config struct {
 }
 
 // NewServer wires up every dependency and returns a single http.Handler.
-// Keeping this as a thin constructor — middleware lives here, routes live
-// in routes.go — makes the surface easy to test end-to-end via run().
+// Routes live in routes.go; cross-cutting middleware is applied here.
 func NewServer(
 	logger *slog.Logger,
 	cfg Config,
-	store Store,
+	widgets store.Store,
 ) http.Handler {
 	mux := http.NewServeMux()
-	addRoutes(mux, logger, cfg, store)
+	addRoutes(mux, logger, cfg, widgets)
 
 	var handler http.Handler = mux
 	handler = withRequestLogging(logger, handler)

@@ -10,15 +10,15 @@ ship a particular feature. The example domain is a trivial in-memory
 
 ## Patterns demonstrated
 
-- `NewServer` constructor in `server.go` returns a single `http.Handler`
-  and wires every dependency. Routes live in `routes.go`; the constructor
-  applies cross-cutting middleware.
-- `run(ctx, args, getenv, stdout, stderr) error` in `run.go` — `main` is a
-  five-line shell that calls it. This makes the whole program trivially
-  testable end-to-end.
+- `NewServer` constructor in `internal/server/server.go` returns a single
+  `http.Handler` and wires every dependency. Routes live in `routes.go`;
+  the constructor applies cross-cutting middleware.
+- `Run(ctx, args, getenv, stdout, stderr) error` in `internal/server/run.go`
+  — `cmd/server/main.go` is a five-line shell that calls it. The whole
+  program is trivially testable end-to-end.
 - Graceful shutdown via `signal.NotifyContext` + `http.Server.Shutdown`.
 - Handlers are factory functions returning `http.Handler`, e.g.
-  `handleCreateWidget(logger, store)`. Per-handler setup (closures over
+  `handleCreateWidget(logger, widgets)`. Per-handler setup (closures over
   dependencies, response types declared inline) lives next to the request
   logic.
 - Generic `encode[T]` / `decode[T]` helpers in `encoding.go`. `decode`
@@ -29,35 +29,60 @@ ship a particular feature. The example domain is a trivial in-memory
   `withRecover`).
 - `net/http`'s Go 1.22+ ServeMux is used for method+path routing
   (`GET /api/widgets/{id}`) — no third-party router needed.
-- `server_test.go` boots the real binary via `run()` on a random port and
+- `server_test.go` boots the real binary via `Run()` on a random port and
   exercises it over real HTTP, using a `waitForReady` poll.
 
 ## Layout
 
 ```
 golang-http-service/
-  main.go         // 5-line main, calls run()
-  run.go          // run(ctx, args, getenv, stdout, stderr) error
-  server.go       // NewServer constructor
-  routes.go       // addRoutes(mux, deps...)
-  handlers.go     // handleX factory functions
-  middleware.go   // withRequestLogging, withRecover
-  encoding.go     // encode/decode generics + Validator interface
-  store.go        // Store interface + in-memory implementation
-  server_test.go  // end-to-end test that drives run()
+  justfile
+  go.mod
+  README.md
+  cmd/
+    server/
+      main.go              # signal.NotifyContext + server.Run
+  internal/
+    server/                # one flat package — all HTTP code
+      server.go            # NewServer
+      run.go               # Run(ctx, args, getenv, stdout, stderr)
+      routes.go            # addRoutes(mux, deps...)
+      handlers.go          # handleX factory functions
+      middleware.go        # withRequestLogging, withRecover
+      encoding.go          # encode/decode generics + Validator
+      server_test.go       # end-to-end test driving Run()
+    store/
+      store.go             # Store interface + MemoryStore
 ```
+
+Idiomatic Go: `cmd/<binary>/` for entry points and `internal/` for the
+language-enforced private packages. Inside `internal/server` the
+package is kept flat — splitting `handlers`, `middleware`, `routes`
+into separate packages would create import ceremony without buying
+isolation (they all share types and reference each other).
+
+`internal/store` is lifted out because it has a clean interface
+boundary: handlers depend on `store.Store`, not on the concrete
+`MemoryStore`. A future `postgres.go` or `redis.go` would slot in
+without touching HTTP code.
 
 ## Running
 
+Via `just`:
+
 ```sh
-go run .                       # listens on 127.0.0.1:8080
-HOST=0.0.0.0 PORT=9000 go run .
-go run . -host 0.0.0.0 -port 9000
+just run                # listens on 127.0.0.1:8080
+HOST=0.0.0.0 PORT=9000 just run
+just build              # binary at ./bin/server
+just test               # go test ./...
+just check              # fmt + vet + test
+just --list             # all recipes
 ```
 
-## Testing
+Or directly:
 
 ```sh
+go run ./cmd/server
 go test ./...
 ```
 
@@ -70,12 +95,11 @@ go test ./...
 | GET    | `/api/widgets/{id}` | -                             | `Widget` or 404 |
 | POST   | `/api/widgets`      | `{"name":"...","price":123}`  | 201 with widget, or 422 with `problems` |
 
-Try it:
+The justfile includes curl helpers against a running server:
 
 ```sh
-curl -sX POST localhost:8080/api/widgets \
-  -H 'content-type: application/json' \
-  -d '{"name":"sprocket","price":42}'
-
-curl -s localhost:8080/api/widgets
+just healthz
+just create-widget sprocket 42
+just list-widgets
+just get-widget 1
 ```

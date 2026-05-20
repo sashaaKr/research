@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+
+	"github.com/sashaakr/research/golang-http-service/internal/server"
 )
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
-	if err := run(ctx, os.Args, os.Getenv, os.Stdout, os.Stderr); err != nil {
+	if err := server.Run(ctx, os.Args, os.Getenv, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(1)
 	}

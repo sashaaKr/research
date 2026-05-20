@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"bytes"
@@ -11,9 +11,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sashaakr/research/golang-http-service/internal/store"
 )
 
-// TestRun spins the real binary up via run() on a random port and exercises
+// TestRun spins the real binary up via Run() on a random port and exercises
 // the HTTP surface — the pattern the article recommends so tests touch the
 // same wiring main uses.
 func TestRun(t *testing.T) {
@@ -23,7 +25,7 @@ func TestRun(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- run(
+		done <- Run(
 			ctx,
 			[]string{"test", "-host", "127.0.0.1", "-port", port},
 			func(string) string { return "" },
@@ -47,7 +49,7 @@ func TestRun(t *testing.T) {
 			t.Fatalf("create status = %d, body = %s", resp.StatusCode, b)
 		}
 		var created struct {
-			Widget Widget `json:"widget"`
+			Widget store.Widget `json:"widget"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
 			t.Fatal(err)
@@ -64,7 +66,7 @@ func TestRun(t *testing.T) {
 		if resp2.StatusCode != http.StatusOK {
 			t.Fatalf("get status = %d", resp2.StatusCode)
 		}
-		var got Widget
+		var got store.Widget
 		if err := json.NewDecoder(resp2.Body).Decode(&got); err != nil {
 			t.Fatal(err)
 		}
@@ -104,10 +106,10 @@ func TestRun(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("run returned: %v", err)
+			t.Fatalf("Run returned: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("run did not shut down in time")
+		t.Fatal("Run did not shut down in time")
 	}
 }
 
