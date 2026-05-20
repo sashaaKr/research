@@ -22,14 +22,13 @@ func RetryDemoWorkflow(ctx workflow.Context) (string, error) {
 	}
 	flakyCtx := workflow.WithActivityOptions(ctx, flakyOpts)
 
-	attempt := 0
 	var flakyResult string
-	err := workflow.ExecuteActivity(flakyCtx, FlakyActivity, &attempt).Get(flakyCtx, &flakyResult)
+	err := workflow.ExecuteActivity(flakyCtx, FlakyActivity).Get(flakyCtx, &flakyResult)
 	if err != nil {
 		logger.Info("FlakyActivity failed after retries", "error", err)
 		return "", fmt.Errorf("flaky activity failed: %w", err)
 	}
-	logger.Info("FlakyActivity succeeded", "result", flakyResult, "totalAttempts", attempt)
+	logger.Info("FlakyActivity succeeded", "result", flakyResult)
 
 	// Run RiskyActivity with shouldFail=false
 	riskyOpts := workflow.ActivityOptions{
@@ -54,6 +53,6 @@ func RetryDemoWorkflow(ctx workflow.Context) (string, error) {
 		logger.Info("RiskyActivity(true) unexpectedly succeeded", "result", fatalResult)
 	}
 
-	summary := fmt.Sprintf("flaky=%s risky_safe=%s risky_fatal=caught", flakyResult, riskyResult)
+	summary := fmt.Sprintf("flaky=%q risky_safe=%q risky_fatal=caught", flakyResult, riskyResult)
 	return summary, nil
 }
