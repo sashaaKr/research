@@ -14,6 +14,7 @@ func addRoutes(
 	widgets store.Store,
 ) {
 	mux.Handle("GET /healthz", handleHealthz())
+	mux.Handle("GET /hello/{name}", handleHello())
 	mux.Handle("GET /api/widgets", handleListWidgets(logger, widgets))
 	mux.Handle("GET /api/widgets/{id}", handleGetWidget(logger, widgets))
 	mux.Handle("POST /api/widgets", handleCreateWidget(logger, widgets))

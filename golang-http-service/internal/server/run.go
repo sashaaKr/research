@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
 	"time"
 
@@ -19,10 +21,13 @@ func Run(
 	ctx context.Context,
 	args []string,
 	getenv func(string) string,
+	stdin io.Reader,
 	stdout io.Writer,
 	stderr io.Writer,
 ) error {
-	ctx, cancel := context.WithCancel(ctx)
+	_ = stdin // reserved for future use (matches article signature)
+
+	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt)
 	defer cancel()
 
 	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)

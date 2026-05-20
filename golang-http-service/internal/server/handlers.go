@@ -3,15 +3,17 @@ package server
 import (
 	"context"
 	"errors"
+	"html/template"
 	"log/slog"
 	"net/http"
+	"sync"
 
 	"github.com/sashaakr/research/golang-http-service/internal/store"
 )
 
 func handleHealthz() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = encode(w, http.StatusOK, map[string]string{"status": "ok"})
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = encode(w, r, http.StatusOK, map[string]string{"status": "ok"})
 	})
 }
 
@@ -26,7 +28,7 @@ func handleListWidgets(logger *slog.Logger, widgets store.Store) http.Handler {
 			http.Error(w, "list failed", http.StatusInternalServerError)
 			return
 		}
-		_ = encode(w, http.StatusOK, response{Widgets: items})
+		_ = encode(w, r, http.StatusOK, response{Widgets: items})
 	})
 }
 
@@ -43,7 +45,7 @@ func handleGetWidget(logger *slog.Logger, widgets store.Store) http.Handler {
 			http.Error(w, "get failed", http.StatusInternalServerError)
 			return
 		}
-		_ = encode(w, http.StatusOK, widget)
+		_ = encode(w, r, http.StatusOK, widget)
 	})
 }
 
@@ -52,12 +54,12 @@ type createWidgetRequest struct {
 	Price int    `json:"price"`
 }
 
-func (r createWidgetRequest) Valid(_ context.Context) map[string]string {
+func (req createWidgetRequest) Valid(_ context.Context) map[string]string {
 	problems := map[string]string{}
-	if r.Name == "" {
+	if req.Name == "" {
 		problems["name"] = "must not be empty"
 	}
-	if r.Price < 0 {
+	if req.Price < 0 {
 		problems["price"] = "must be non-negative"
 	}
 	return problems
@@ -69,9 +71,9 @@ func handleCreateWidget(logger *slog.Logger, widgets store.Store) http.Handler {
 		Problems map[string]string `json:"problems,omitempty"`
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		req, problems, err := decode[createWidgetRequest](r)
+		req, problems, err := decodeValid[createWidgetRequest](r)
 		if len(problems) > 0 {
-			_ = encode(w, http.StatusUnprocessableEntity, response{Problems: problems})
+			_ = encode(w, r, http.StatusUnprocessableEntity, response{Problems: problems})
 			return
 		}
 		if err != nil {
@@ -84,6 +86,30 @@ func handleCreateWidget(logger *slog.Logger, widgets store.Store) http.Handler {
 			http.Error(w, "create failed", http.StatusInternalServerError)
 			return
 		}
-		_ = encode(w, http.StatusCreated, response{Widget: created})
+		_ = encode(w, r, http.StatusCreated, response{Widget: created})
+	})
+}
+
+// handleHello demonstrates the sync.Once pattern: expensive per-handler
+// setup (template parsing) is deferred until the first request, then
+// reused. If startup fails, the error is captured and surfaced on every
+// subsequent call rather than swallowed.
+func handleHello() http.Handler {
+	const tmpl = `<!doctype html><html><body><h1>Hello, {{.Name}}!</h1></body></html>`
+	var (
+		initOnce sync.Once
+		tpl      *template.Template
+		tplErr   error
+	)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		initOnce.Do(func() {
+			tpl, tplErr = template.New("hello").Parse(tmpl)
+		})
+		if tplErr != nil {
+			http.Error(w, tplErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_ = tpl.Execute(w, struct{ Name string }{Name: r.PathValue("name")})
 	})
 }

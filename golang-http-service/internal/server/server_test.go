@@ -15,13 +15,14 @@ import (
 	"github.com/sashaakr/research/golang-http-service/internal/store"
 )
 
-// TestRun spins the real binary up via Run() on a random port and exercises
-// the HTTP surface — the pattern the article recommends so tests touch the
-// same wiring main uses.
+// TestRun boots the real binary via Run() on a random port and exercises
+// it over HTTP. Each test gets a self-contained instance — context
+// cancellation on cleanup gracefully shuts the server down.
 func TestRun(t *testing.T) {
+	t.Parallel()
+
 	port := freePort(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	done := make(chan error, 1)
 	go func() {
@@ -29,13 +30,27 @@ func TestRun(t *testing.T) {
 			ctx,
 			[]string{"test", "-host", "127.0.0.1", "-port", port},
 			func(string) string { return "" },
+			strings.NewReader(""),
 			io.Discard,
 			io.Discard,
 		)
 	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("Run returned: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("Run did not shut down in time")
+		}
+	})
 
 	base := "http://127.0.0.1:" + port
-	waitForReady(t, base+"/healthz")
+	if err := waitForReady(ctx, 5*time.Second, base+"/healthz"); err != nil {
+		t.Fatalf("waitForReady: %v", err)
+	}
 
 	t.Run("create then get", func(t *testing.T) {
 		body := bytes.NewBufferString(`{"name":"sprocket","price":42}`)
@@ -102,15 +117,20 @@ func TestRun(t *testing.T) {
 		}
 	})
 
-	cancel()
-	select {
-	case err := <-done:
+	t.Run("hello template uses sync.Once", func(t *testing.T) {
+		resp, err := http.Get(base + "/hello/sasha")
 		if err != nil {
-			t.Fatalf("Run returned: %v", err)
+			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not shut down in time")
-	}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		if !strings.Contains(string(b), "Hello, sasha!") {
+			t.Fatalf("unexpected body: %s", b)
+		}
+	})
 }
 
 func freePort(t *testing.T) string {
@@ -123,19 +143,32 @@ func freePort(t *testing.T) string {
 	return fmt.Sprint(l.Addr().(*net.TCPAddr).Port)
 }
 
-func waitForReady(t *testing.T, url string) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	client := &http.Client{Timeout: 200 * time.Millisecond}
-	for time.Now().Before(deadline) {
-		resp, err := client.Get(url)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return
-			}
+// waitForReady calls endpoint until it returns 200 or until ctx is
+// cancelled or timeout elapses. Matches the helper from the article.
+func waitForReady(ctx context.Context, timeout time.Duration, endpoint string) error {
+	client := http.Client{}
+	startTime := time.Now()
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return fmt.Errorf("create request: %w", err)
 		}
-		time.Sleep(50 * time.Millisecond)
+		resp, err := client.Do(req)
+		if err == nil {
+			if resp.StatusCode == http.StatusOK {
+				resp.Body.Close()
+				return nil
+			}
+			resp.Body.Close()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			if time.Since(startTime) >= timeout {
+				return fmt.Errorf("timeout waiting for %s", endpoint)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
-	t.Fatalf("server did not become ready at %s", url)
 }

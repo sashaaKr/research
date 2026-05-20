@@ -10,27 +10,39 @@ ship a particular feature. The example domain is a trivial in-memory
 
 ## Patterns demonstrated
 
-- `NewServer` constructor in `internal/server/server.go` returns a single
-  `http.Handler` and wires every dependency. Routes live in `routes.go`;
-  the constructor applies cross-cutting middleware.
-- `Run(ctx, args, getenv, stdout, stderr) error` in `internal/server/run.go`
-  — `cmd/server/main.go` is a five-line shell that calls it. The whole
-  program is trivially testable end-to-end.
-- Graceful shutdown via `signal.NotifyContext` + `http.Server.Shutdown`.
-- Handlers are factory functions returning `http.Handler`, e.g.
-  `handleCreateWidget(logger, widgets)`. Per-handler setup (closures over
-  dependencies, response types declared inline) lives next to the request
-  logic.
-- Generic `encode[T]` / `decode[T]` helpers in `encoding.go`. `decode`
-  automatically calls a `Validator` interface if the request type
-  implements it, returning a `map[string]string` of problems for 422
-  responses.
-- Middleware are plain `http.Handler` wrappers (`withRequestLogging`,
-  `withRecover`).
-- `net/http`'s Go 1.22+ ServeMux is used for method+path routing
-  (`GET /api/widgets/{id}`) — no third-party router needed.
-- `server_test.go` boots the real binary via `Run()` on a random port and
-  exercises it over real HTTP, using a `waitForReady` poll.
+- **`NewServer` constructor** in `internal/server/server.go` returns a
+  single `http.Handler` and takes every dependency as an argument. Routes
+  live in `routes.go`; the constructor applies cross-cutting middleware.
+- **`func main()` only calls `Run`.** `Run(ctx, args, getenv, stdin,
+  stdout, stderr) error` takes the OS fundamentals as arguments so tests
+  can drive the same entry point with controlled inputs. `cmd/server/main.go`
+  is the five-line shell.
+- **`signal.NotifyContext` lives inside `Run`** (not in `main`) so its
+  `cancel` actually runs — per the explicit EDIT note in the article.
+- **Graceful shutdown** via the cancelled context + `http.Server.Shutdown`.
+- **Maker funcs return the handler.** Handlers are factory functions
+  returning `http.Handler`, e.g. `handleCreateWidget(logger, widgets)`,
+  with per-handler setup and inline request/response types living in the
+  closure.
+- **Generic `encode` / `decode` / `decodeValid` helpers** in `encoding.go`.
+  `encode[T]` takes `(w, r, status, v)` (the `r` is kept for future
+  content negotiation). `decode[T]` is the plain JSON path; `decodeValid[T
+  Validator]` constrains `T` to types that implement the `Validator`
+  interface and rejects values whose `Valid` returns problems.
+- **`Validator` single-method interface** returning `map[string]string`
+  of field → human-readable explanation. The 422 response surfaces the
+  same map under `problems`.
+- **`sync.Once` for deferred per-handler setup.** `handleHello` parses
+  its template lazily on first request and reuses it; init errors are
+  captured outside the `Do` block and surfaced on every call.
+- **Adapter-style middleware** as plain `http.Handler` wrappers
+  (`withRequestLogging`, `withRecover`).
+- **Go 1.22+ ServeMux** for method+path routing (`GET /api/widgets/{id}`)
+  — no third-party router.
+- **End-to-end testing via `Run`.** `server_test.go` boots the real
+  binary on a random port, polls a `waitForReady(ctx, timeout, endpoint)`
+  helper, and exercises the HTTP surface like a real user. `t.Cleanup`
+  cancels the context and verifies graceful shutdown.
 
 ## Layout
 
@@ -91,6 +103,7 @@ go test ./...
 | Method | Path                | Body                          | Response |
 | ------ | ------------------- | ----------------------------- | -------- |
 | GET    | `/healthz`          | -                             | `{"status":"ok"}` |
+| GET    | `/hello/{name}`     | -                             | HTML rendered from a `sync.Once`-parsed template |
 | GET    | `/api/widgets`      | -                             | `{"widgets":[...]}` |
 | GET    | `/api/widgets/{id}` | -                             | `Widget` or 404 |
 | POST   | `/api/widgets`      | `{"name":"...","price":123}`  | 201 with widget, or 422 with `problems` |
