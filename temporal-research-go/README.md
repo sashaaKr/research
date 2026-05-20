@@ -17,17 +17,17 @@ Progressive Temporal SDK examples in Go, mirroring the Python examples in `../te
 go mod tidy
 
 # Run any example
-go run ./01_hello_world/
-go run ./02_retry_and_errors/
-go run ./03_signals_and_queries/
-go run ./04_timers_and_sleep/
-go run ./05_child_workflows/
-go run ./06_schedules/
-go run ./07_provisioning/
-go run ./08_template_runner/
+go run ./01_hello_world/cmd/
+go run ./02_retry_and_errors/cmd/
+go run ./03_signals_and_queries/cmd/
+go run ./04_timers_and_sleep/cmd/
+go run ./05_child_workflows/cmd/
+go run ./06_schedules/cmd/
+go run ./07_provisioning/cmd/
+go run ./08_template_runner/cmd/
 ```
 
-Each `main.go` starts an in-process worker **and** submits a workflow, so a single command gives you the full demo.
+Each `cmd/main.go` starts an in-process worker **and** submits a workflow, so a single command gives you the full demo. Workflow + activity code lives in the parent package; `cmd/` holds only the entry point.
 
 ## Examples
 

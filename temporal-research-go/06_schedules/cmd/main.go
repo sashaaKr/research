@@ -56,9 +56,12 @@ func main() {
 	}
 
 	// 2. List existing schedules
-	listHandle := scheduleClient.List(ctx, client.ScheduleListOptions{})
+	listHandle, listErr := scheduleClient.List(ctx, client.ScheduleListOptions{})
+	if listErr != nil {
+		log.Printf("Failed to list schedules: %v", listErr)
+	}
 	fmt.Println("Existing schedules:")
-	for listHandle.HasNext() {
+	for listHandle != nil && listHandle.HasNext() {
 		entry, err := listHandle.Next()
 		if err != nil {
 			log.Printf("Error listing schedules: %v", err)
