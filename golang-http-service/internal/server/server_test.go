@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,7 +27,7 @@ const (
 func TestRun(t *testing.T) {
 	t.Parallel()
 
-	base := startServer(t)
+	base := startServer(t, io.Discard)
 	must := mustFn(t)
 
 	t.Run("healthz is public", func(t *testing.T) {
@@ -147,7 +148,7 @@ func TestRun(t *testing.T) {
 	})
 }
 
-func startServer(t *testing.T) string {
+func startServer(t *testing.T, stdout io.Writer) string {
 	t.Helper()
 	port := freePort(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -159,7 +160,7 @@ func startServer(t *testing.T) string {
 			[]string{"test", "-host", "127.0.0.1", "-port", port},
 			func(string) string { return "" },
 			strings.NewReader(""),
-			io.Discard,
+			stdout,
 			io.Discard,
 		)
 	}()
@@ -219,6 +220,88 @@ func mustFn(t *testing.T) func(*http.Response, error) *http.Response {
 		}
 		return resp
 	}
+}
+
+// syncBuffer is an io.Writer + stringer that's safe to read while the
+// server goroutine writes to it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+func TestRequestLoggingContext(t *testing.T) {
+	t.Parallel()
+
+	logs := &syncBuffer{}
+	base := startServer(t, logs)
+	must := mustFn(t)
+
+	t.Run("X-Request-Id header is echoed when client provides it", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, base+"/healthz", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-Request-Id", "test-rid-echo")
+		resp := must(http.DefaultClient.Do(req))
+		defer resp.Body.Close()
+		if got := resp.Header.Get("X-Request-Id"); got != "test-rid-echo" {
+			t.Fatalf("X-Request-Id response header = %q, want %q", got, "test-rid-echo")
+		}
+		waitForLog(t, logs, "request_id=test-rid-echo")
+	})
+
+	t.Run("server generates X-Request-Id when client omits it", func(t *testing.T) {
+		resp := must(http.Get(base + "/healthz"))
+		defer resp.Body.Close()
+		if got := resp.Header.Get("X-Request-Id"); got == "" {
+			t.Fatalf("expected server to generate X-Request-Id")
+		}
+	})
+
+	t.Run("authed request log line includes user_id and admin attrs", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, base+"/api/widgets", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-Request-Id", "test-rid-authed")
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		resp := must(http.DefaultClient.Do(req))
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		// The auth middleware adds user_id to the bag *after*
+		// withRequestLogging has registered its deferred log call —
+		// the mutable bag is what makes both attrs land on the same
+		// log line.
+		waitForLog(t, logs, "request_id=test-rid-authed")
+		waitForLog(t, logs, "user_id=u2")
+		waitForLog(t, logs, "admin=true")
+	})
+}
+
+func waitForLog(t *testing.T, logs *syncBuffer, substr string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(logs.String(), substr) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("did not see %q in logs.\n--- logs ---\n%s", substr, logs.String())
 }
 
 // waitForReady calls endpoint until it returns 200 or until ctx is

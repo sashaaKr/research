@@ -49,6 +49,16 @@ ship a particular feature. The example domain is a trivial in-memory
 - **`withRequestLogging` / `withRecover`** stay as plain
   `(logger, next) -> http.Handler` wrappers — applied once at the top of
   `NewServer`, so the factory form would buy nothing.
+- **Per-request logging context (`internal/logging`)** — `ContextHandler`
+  wraps the base `slog.Handler` and merges a per-request *attribute bag*
+  (a `*struct{ mu sync.Mutex; attrs []slog.Attr }` stored in `ctx`) into
+  every record. `withRequestID` seeds the bag with `request_id` (echoed
+  on the `X-Request-Id` response header), `newAuthMiddleware` adds
+  `user_id` and `admin` after a successful authenticate, and handlers
+  use `logger.InfoContext(r.Context(), ...)` so every log line is
+  tagged. The bag is mutable on purpose: `withRequestLogging` emits its
+  log line *after* the inner handler returns, so attrs added by auth
+  appear on the request log line too.
 - **Go 1.22+ ServeMux** for method+path routing (`GET /api/widgets/{id}`)
   — no third-party router.
 - **End-to-end testing via `Run`.** `server_test.go` boots the real
@@ -81,6 +91,9 @@ golang-http-service/
     auth/
       auth.go              # User, Authenticator interface,
                            # context helpers, StaticAuthenticator demo
+    logging/
+      logging.go           # ContextHandler + per-request attr bag,
+                           # NewLogger wraps slog.NewTextHandler
 ```
 
 Idiomatic Go: `cmd/<binary>/` for entry points and `internal/` for the
@@ -131,6 +144,21 @@ Demo tokens (hard-coded in `Run` via `auth.NewStatic`):
 Authorization: Bearer demo-user-token     # ordinary user
 Authorization: Bearer demo-admin-token    # admin
 ```
+
+Every response carries an `X-Request-Id` header (echoed if the client
+supplied one, generated otherwise). Server logs use `slog` text format
+with the per-request bag attributes merged in:
+
+```
+time=… level=INFO msg=request method=GET   path=/healthz       status=200 duration=39µs   request_id=23763a9a350c4f90
+time=… level=INFO msg=request method=POST  path=/api/widgets   status=201 duration=174µs  request_id=demo-rid-001 user_id=u2 admin=true
+time=… level=INFO msg=request method=GET   path=/api/widgets   status=200 duration=58µs   request_id=134ad3d14e36dc76 user_id=u1 admin=false
+```
+
+Any log emitted from a handler or downstream code via
+`logger.InfoContext(r.Context(), …)` (or `slog.InfoContext(ctx, …)`)
+picks up the same `request_id` / `user_id`, so a single request's log
+lines can be grepped together.
 
 The justfile includes curl helpers against a running server (tokens
 default to the demo values; override with `USER_TOKEN` / `ADMIN_TOKEN`):

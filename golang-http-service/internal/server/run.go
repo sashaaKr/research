@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sashaakr/research/golang-http-service/internal/auth"
+	"github.com/sashaakr/research/golang-http-service/internal/logging"
 	"github.com/sashaakr/research/golang-http-service/internal/store"
 )
 
@@ -39,7 +40,7 @@ func Run(
 		return err
 	}
 
-	logger := slog.New(slog.NewTextHandler(stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := logging.NewLogger(stdout, slog.LevelInfo)
 
 	cfg := Config{
 		Host: *host,

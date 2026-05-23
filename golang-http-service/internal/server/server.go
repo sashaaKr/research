@@ -24,8 +24,12 @@ func NewServer(
 	mux := http.NewServeMux()
 	addRoutes(mux, logger, cfg, widgets, auther)
 
+	// Outermost first (executed first on the way in). Order matters:
+	// withRequestID sets up the logging bag before withRequestLogging
+	// emits its deferred request log line, and before any handler runs.
 	var handler http.Handler = mux
 	handler = withRequestLogging(logger, handler)
+	handler = withRequestID(handler)
 	handler = withRecover(logger, handler)
 	return handler
 }

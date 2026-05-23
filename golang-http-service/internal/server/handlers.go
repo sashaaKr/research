@@ -24,7 +24,7 @@ func handleListWidgets(logger *slog.Logger, widgets store.Store) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		items, err := widgets.List(r.Context())
 		if err != nil {
-			logger.Error("list widgets", "err", err)
+			logger.ErrorContext(r.Context(), "list widgets", "err", err)
 			http.Error(w, "list failed", http.StatusInternalServerError)
 			return
 		}
@@ -41,7 +41,7 @@ func handleGetWidget(logger *slog.Logger, widgets store.Store) http.Handler {
 			return
 		}
 		if err != nil {
-			logger.Error("get widget", "id", id, "err", err)
+			logger.ErrorContext(r.Context(), "get widget", "id", id, "err", err)
 			http.Error(w, "get failed", http.StatusInternalServerError)
 			return
 		}
@@ -82,7 +82,7 @@ func handleCreateWidget(logger *slog.Logger, widgets store.Store) http.Handler {
 		}
 		created, err := widgets.Create(r.Context(), store.Widget{Name: req.Name, Price: req.Price})
 		if err != nil {
-			logger.Error("create widget", "err", err)
+			logger.ErrorContext(r.Context(), "create widget", "err", err)
 			http.Error(w, "create failed", http.StatusInternalServerError)
 			return
 		}
@@ -123,7 +123,7 @@ func handleDeleteWidget(logger *slog.Logger, widgets store.Store) http.Handler {
 			return
 		}
 		if err != nil {
-			logger.Error("delete widget", "id", id, "err", err)
+			logger.ErrorContext(r.Context(), "delete widget", "id", id, "err", err)
 			http.Error(w, "delete failed", http.StatusInternalServerError)
 			return
 		}
