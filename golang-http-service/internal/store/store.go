@@ -18,6 +18,7 @@ type Store interface {
 	List(ctx context.Context) ([]Widget, error)
 	Get(ctx context.Context, id string) (Widget, error)
 	Create(ctx context.Context, w Widget) (Widget, error)
+	Delete(ctx context.Context, id string) error
 }
 
 type MemoryStore struct {
@@ -57,6 +58,16 @@ func (s *MemoryStore) Create(_ context.Context, w Widget) (Widget, error) {
 	w.ID = idFromInt(s.nextID)
 	s.widgets[w.ID] = w
 	return w, nil
+}
+
+func (s *MemoryStore) Delete(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.widgets[id]; !ok {
+		return ErrNotFound
+	}
+	delete(s.widgets, id)
+	return nil
 }
 
 func idFromInt(n int) string {

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sashaakr/research/golang-http-service/internal/auth"
 	"github.com/sashaakr/research/golang-http-service/internal/store"
 )
 
@@ -45,8 +46,12 @@ func Run(
 		Port: *port,
 	}
 	widgets := store.NewMemoryStore()
+	auther := auth.NewStatic(map[string]auth.User{
+		"demo-user-token":  {ID: "u1", Name: "demo", Admin: false},
+		"demo-admin-token": {ID: "u2", Name: "admin", Admin: true},
+	})
 
-	srv := NewServer(logger, cfg, widgets)
+	srv := NewServer(logger, cfg, widgets, auther)
 	httpServer := &http.Server{
 		Addr:              net.JoinHostPort(cfg.Host, cfg.Port),
 		Handler:           srv,

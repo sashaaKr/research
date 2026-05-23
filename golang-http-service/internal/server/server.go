@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/sashaakr/research/golang-http-service/internal/auth"
 	"github.com/sashaakr/research/golang-http-service/internal/store"
 )
 
@@ -18,9 +19,10 @@ func NewServer(
 	logger *slog.Logger,
 	cfg Config,
 	widgets store.Store,
+	auther auth.Authenticator,
 ) http.Handler {
 	mux := http.NewServeMux()
-	addRoutes(mux, logger, cfg, widgets)
+	addRoutes(mux, logger, cfg, widgets, auther)
 
 	var handler http.Handler = mux
 	handler = withRequestLogging(logger, handler)

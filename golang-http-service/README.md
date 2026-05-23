@@ -35,8 +35,20 @@ ship a particular feature. The example domain is a trivial in-memory
 - **`sync.Once` for deferred per-handler setup.** `handleHello` parses
   its template lazily on first request and reuses it; init errors are
   captured outside the `Do` block and surfaced on every call.
-- **Adapter-style middleware** as plain `http.Handler` wrappers
-  (`withRequestLogging`, `withRecover`).
+- **Two middleware styles, side by side:**
+  - *Simple adapter* — `adminOnly(next http.Handler) http.Handler` is the
+    article's minimal form: no deps beyond `next`. It reads the user from
+    context (placed there by the auth middleware) and 404s non-admins so
+    routes don't even leak their existence.
+  - *Factory returning middleware* — `newAuthMiddleware(logger, auther)
+    func(http.Handler) http.Handler` binds dependencies once and returns
+    the wrapper. Routes.go calls `requireAuth := newAuthMiddleware(...)`
+    once and then wraps each handler with `requireAuth(...)`, instead of
+    repeating the dep list at every route. This is the pattern to reach
+    for whenever middleware needs more than just `next`.
+- **`withRequestLogging` / `withRecover`** stay as plain
+  `(logger, next) -> http.Handler` wrappers — applied once at the top of
+  `NewServer`, so the factory form would buy nothing.
 - **Go 1.22+ ServeMux** for method+path routing (`GET /api/widgets/{id}`)
   — no third-party router.
 - **End-to-end testing via `Run`.** `server_test.go` boots the real
@@ -53,18 +65,22 @@ golang-http-service/
   README.md
   cmd/
     server/
-      main.go              # signal.NotifyContext + server.Run
+      main.go              # tiny: calls server.Run
   internal/
     server/                # one flat package — all HTTP code
       server.go            # NewServer
-      run.go               # Run(ctx, args, getenv, stdout, stderr)
+      run.go               # Run(ctx, args, getenv, stdin, stdout, stderr)
       routes.go            # addRoutes(mux, deps...)
       handlers.go          # handleX factory functions
-      middleware.go        # withRequestLogging, withRecover
-      encoding.go          # encode/decode generics + Validator
+      middleware.go        # withRequestLogging, withRecover,
+                           # newAuthMiddleware (factory), adminOnly (adapter)
+      encoding.go          # encode/decode/decodeValid + Validator
       server_test.go       # end-to-end test driving Run()
     store/
       store.go             # Store interface + MemoryStore
+    auth/
+      auth.go              # User, Authenticator interface,
+                           # context helpers, StaticAuthenticator demo
 ```
 
 Idiomatic Go: `cmd/<binary>/` for entry points and `internal/` for the
@@ -100,19 +116,30 @@ go test ./...
 
 ## Endpoints
 
-| Method | Path                | Body                          | Response |
-| ------ | ------------------- | ----------------------------- | -------- |
-| GET    | `/healthz`          | -                             | `{"status":"ok"}` |
-| GET    | `/hello/{name}`     | -                             | HTML rendered from a `sync.Once`-parsed template |
-| GET    | `/api/widgets`      | -                             | `{"widgets":[...]}` |
-| GET    | `/api/widgets/{id}` | -                             | `Widget` or 404 |
-| POST   | `/api/widgets`      | `{"name":"...","price":123}`  | 201 with widget, or 422 with `problems` |
+| Method | Path                  | Auth         | Body                          | Response |
+| ------ | --------------------- | ------------ | ----------------------------- | -------- |
+| GET    | `/healthz`            | public       | -                             | `{"status":"ok"}` |
+| GET    | `/hello/{name}`       | public       | -                             | HTML rendered from a `sync.Once`-parsed template |
+| GET    | `/api/widgets`        | Bearer       | -                             | `{"widgets":[...]}` |
+| GET    | `/api/widgets/{id}`   | Bearer       | -                             | `Widget` or 404 |
+| POST   | `/api/widgets`        | Bearer       | `{"name":"...","price":123}`  | 201 with widget, or 422 with `problems` |
+| DELETE | `/api/widgets/{id}`   | Bearer + admin | -                           | 204 on success, 404 otherwise |
 
-The justfile includes curl helpers against a running server:
+Demo tokens (hard-coded in `Run` via `auth.NewStatic`):
+
+```
+Authorization: Bearer demo-user-token     # ordinary user
+Authorization: Bearer demo-admin-token    # admin
+```
+
+The justfile includes curl helpers against a running server (tokens
+default to the demo values; override with `USER_TOKEN` / `ADMIN_TOKEN`):
 
 ```sh
 just healthz
+just hello sasha
 just create-widget sprocket 42
 just list-widgets
 just get-widget 1
+just delete-widget 1            # uses ADMIN_TOKEN
 ```

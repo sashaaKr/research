@@ -113,3 +113,20 @@ func handleHello() http.Handler {
 		_ = tpl.Execute(w, struct{ Name string }{Name: r.PathValue("name")})
 	})
 }
+
+func handleDeleteWidget(logger *slog.Logger, widgets store.Store) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		err := widgets.Delete(r.Context(), id)
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(w, "widget not found", http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			logger.Error("delete widget", "id", id, "err", err)
+			http.Error(w, "delete failed", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+}
