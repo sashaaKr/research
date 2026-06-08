@@ -1,0 +1,82 @@
+# Run `just <recipe>`; `just` alone lists recipes.
+set shell := ["bash", "-cu"]
+
+binary      := "bin/server"
+pkg         := "./cmd/server"
+host        := env_var_or_default("HOST", "127.0.0.1")
+port        := env_var_or_default("PORT", "8080")
+user_token  := env_var_or_default("USER_TOKEN", "demo-user-token")
+admin_token := env_var_or_default("ADMIN_TOKEN", "demo-admin-token")
+
+default:
+    @just --list
+
+# Run the server (HOST/PORT env vars or defaults)
+run:
+    go run {{pkg}} -host {{host}} -port {{port}}
+
+# Build the binary into ./bin/server
+build:
+    mkdir -p bin
+    go build -o {{binary}} {{pkg}}
+
+# Run all tests
+test:
+    go test ./...
+
+# Run all tests with verbose output and race detector
+test-verbose:
+    go test -v -race ./...
+
+# go vet
+vet:
+    go vet ./...
+
+# gofmt every file in place
+fmt:
+    gofmt -w .
+
+# go mod tidy
+tidy:
+    go mod tidy
+
+# fmt + vet + test — run before committing
+check: fmt vet test
+
+# Remove build output
+clean:
+    rm -rf bin
+
+# --- curl helpers (point at a running server) ---
+# Use TOKEN= to override; defaults to the demo user token. Admin endpoints
+# use ADMIN_TOKEN (default `demo-admin-token`).
+
+# GET /healthz (public)
+healthz:
+    curl -sS http://{{host}}:{{port}}/healthz | (jq . 2>/dev/null || cat)
+
+# GET /hello/{name} (public, sync.Once template)
+hello name="world":
+    curl -sS http://{{host}}:{{port}}/hello/{{name}}
+
+# GET /api/widgets (auth)
+list-widgets:
+    curl -sS -H 'Authorization: Bearer {{user_token}}' http://{{host}}:{{port}}/api/widgets | (jq . 2>/dev/null || cat)
+
+# GET /api/widgets/{id} (auth)
+get-widget id:
+    curl -sS -H 'Authorization: Bearer {{user_token}}' http://{{host}}:{{port}}/api/widgets/{{id}} | (jq . 2>/dev/null || cat)
+
+# POST /api/widgets (auth)
+create-widget name="sprocket" price="42":
+    curl -sS -X POST http://{{host}}:{{port}}/api/widgets \
+      -H 'Authorization: Bearer {{user_token}}' \
+      -H 'content-type: application/json' \
+      -d '{"name":"{{name}}","price":{{price}}}' | (jq . 2>/dev/null || cat)
+
+# DELETE /api/widgets/{id} (admin only)
+delete-widget id:
+    curl -sS -o /dev/stderr -w 'status=%{http_code}\n' \
+      -X DELETE \
+      -H 'Authorization: Bearer {{admin_token}}' \
+      http://{{host}}:{{port}}/api/widgets/{{id}}
