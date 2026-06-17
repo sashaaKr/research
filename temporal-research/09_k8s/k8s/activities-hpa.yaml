@@ -1,0 +1,68 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: temporal-activities-hpa
+  namespace: temporal-workers
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: temporal-activities
+
+  minReplicas: 2    # always keep at least 2 for HA
+  maxReplicas: 20
+
+  metrics:
+    # CPU-based scaling — simple and works without extra infra.
+    # Each pod is capped at 2 CPU (see Deployment limits).
+    # At 60% utilisation (~1.2 CPU/pod) we start adding pods.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type:               AverageValue
+          averageValue:       "1200m"   # 60% of the 2-CPU limit
+
+  behavior:
+    scaleUp:
+      # Scale up fast — provisioning backlogs hurt latency
+      stabilizationWindowSeconds: 30
+      policies:
+        - type:          Pods
+          value:         4          # add up to 4 pods per interval
+          periodSeconds: 60
+    scaleDown:
+      # Scale down slowly — avoid terminating pods with in-flight activities.
+      # In-flight activities will complete during GRACEFUL_SHUTDOWN_SECS before
+      # the pod exits, but we still prefer stability over quick scale-down.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type:          Pods
+          value:         2          # remove at most 2 pods per interval
+          periodSeconds: 120
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Production alternative: KEDA with the Temporal scaler
+# https://keda.sh/docs/scalers/temporal/
+#
+# KEDA can scale based on the actual task queue backlog depth — the number
+# of tasks waiting to be picked up. This is more accurate than CPU:
+#
+# apiVersion: keda.sh/v1alpha1
+# kind: ScaledObject
+# metadata:
+#   name: temporal-activities-scaledobject
+#   namespace: temporal-workers
+# spec:
+#   scaleTargetRef:
+#     name: temporal-activities
+#   minReplicaCount: 2
+#   maxReplicaCount: 20
+#   triggers:
+#     - type: temporal
+#       metadata:
+#         endpoint:         "temporal.temporal-server.svc.cluster.local:7233"
+#         namespace:        "default"
+#         queueName:        "provisioning-queue"
+#         targetQueueSize:  "5"    # add a pod per 5 queued tasks
+# ─────────────────────────────────────────────────────────────────────────────

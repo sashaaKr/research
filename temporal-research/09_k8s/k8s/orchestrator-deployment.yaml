@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal-orchestrator
+  namespace: temporal-workers
+  labels:
+    app: temporal-orchestrator
+    worker-type: orchestrator
+spec:
+  # Fixed replica count — orchestrator is lightweight, 2 replicas is enough
+  # for HA. Workflow tasks are fast (microseconds of CPU); 2 pods can handle
+  # thousands of concurrent workflows.
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: temporal-orchestrator
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0   # never go below 2 running pods during rollout
+      maxSurge: 1
+
+  template:
+    metadata:
+      labels:
+        app: temporal-orchestrator
+        worker-type: orchestrator
+      annotations:
+        # Force a rollout when the ConfigMap changes (optional pattern)
+        configmap-hash: "update-this-on-configmap-change"
+
+    spec:
+      # Allow enough time for in-flight workflow tasks to drain.
+      # Must be greater than GRACEFUL_SHUTDOWN_SECS.
+      terminationGracePeriodSeconds: 60
+
+      containers:
+        - name: worker
+          image: your-registry/temporal-worker:latest   # replace with your image
+          imagePullPolicy: Always
+
+          env:
+            - name: WORKER_TYPE
+              value: "orchestrator"         # only registers TemplateRunnerWorkflow
+
+            - name: TASK_QUEUE
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: ORCHESTRATOR_TASK_QUEUE
+
+            # Tells the workflow WHERE to send activity tasks.
+            # Activities worker picks them up from this queue.
+            - name: ACTIVITY_TASK_QUEUE
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: ACTIVITY_TASK_QUEUE
+
+            - name: TEMPORAL_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: TEMPORAL_HOST
+
+            - name: TEMPORAL_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: TEMPORAL_NAMESPACE
+
+            - name: MAX_CONCURRENT_WORKFLOW_TASKS
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: ORCHESTRATOR_MAX_CONCURRENT_WORKFLOW_TASKS
+
+            - name: GRACEFUL_SHUTDOWN_SECS
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: GRACEFUL_SHUTDOWN_SECS
+
+            # Uncomment to use Temporal Cloud TLS:
+            # - name: TEMPORAL_TLS_CERT
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: temporal-cloud-tls
+            #       key: TEMPORAL_TLS_CERT
+            # - name: TEMPORAL_TLS_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: temporal-cloud-tls
+            #       key: TEMPORAL_TLS_KEY
+
+          # Orchestrator is I/O-only (no CPU-heavy work) — small resource footprint
+          resources:
+            requests:
+              cpu:    "100m"
+              memory: "128Mi"
+            limits:
+              cpu:    "500m"
+              memory: "256Mi"
+
+          # Liveness: restart the pod if the process dies
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import sys; sys.exit(0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+
+      # Spread replicas across nodes so a single node failure
+      # doesn't take both pods down
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: temporal-orchestrator

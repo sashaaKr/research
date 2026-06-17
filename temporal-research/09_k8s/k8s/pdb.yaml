@@ -1,0 +1,29 @@
+# PodDisruptionBudgets ensure rolling updates, node drains, and cluster
+# upgrades never take all replicas down simultaneously.
+
+# Orchestrator: always keep at least 1 running so workflow tasks aren't orphaned
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: temporal-orchestrator-pdb
+  namespace: temporal-workers
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: temporal-orchestrator
+
+---
+
+# Activities: always keep at least 1 running so in-flight activities
+# can be picked up by the surviving pod while others drain
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: temporal-activities-pdb
+  namespace: temporal-workers
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: temporal-activities

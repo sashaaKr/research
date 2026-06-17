@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: temporal-worker-config
+  namespace: temporal-workers
+data:
+  # Kind nodes are joined to the docker-compose "temporal-net" network,
+  # so the "temporal" service hostname resolves directly from inside pods.
+  TEMPORAL_HOST:      "temporal:7233"
+  TEMPORAL_NAMESPACE: "default"
+
+  ORCHESTRATOR_TASK_QUEUE: "template-runner-queue"
+  ACTIVITY_TASK_QUEUE:     "provisioning-queue"
+
+  # Dialled back for a laptop — raise if you want to stress-test locally.
+  ORCHESTRATOR_MAX_CONCURRENT_WORKFLOW_TASKS: "20"
+  ACTIVITIES_MAX_CONCURRENT_ACTIVITIES:       "10"
+
+  # 25s < terminationGracePeriodSeconds (30s) in both Deployments
+  GRACEFUL_SHUTDOWN_SECS: "25"

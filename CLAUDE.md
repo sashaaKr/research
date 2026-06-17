@@ -12,3 +12,10 @@ This is a research monorepo. Each top-level folder is an independent project exp
 - Build, test, and lint commands vary per project — always discover them from the project's own config files rather than assuming.
 - When adding a new research project, create a new top-level folder. Include a README.md in it describing the goal, the technology being explored, and how to run it.
 - There is no shared dependency management or build system across projects.
+
+## Python Projects
+
+- All Python projects must use **uv** for dependency and environment management.
+- Use `pyproject.toml` for project metadata and dependencies — never `requirements.txt`.
+- Install dependencies with `uv sync`. Run scripts with `uv run python <script>` (or activate the venv with `source .venv/bin/activate` first).
+- Add dependencies with `uv add <package>`, dev-only dependencies with `uv add --dev <package>`.

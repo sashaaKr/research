@@ -1,0 +1,34 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: temporal-worker-config
+  namespace: temporal-workers
+data:
+  # ── Temporal server ───────────────────────────────────────────────────────
+  # Self-hosted: service name within the cluster (or external DNS)
+  # Temporal Cloud: replace with your Cloud endpoint and set TLS in secret.yaml
+  TEMPORAL_HOST:      "temporal.temporal-server.svc.cluster.local:7233"
+  TEMPORAL_NAMESPACE: "default"
+
+  # ── Task queues ───────────────────────────────────────────────────────────
+  # Orchestrator polls this queue for workflow tasks (light CPU/memory).
+  ORCHESTRATOR_TASK_QUEUE: "template-runner-queue"
+  # Activities worker polls this queue for activity tasks (CPU/memory intensive).
+  ACTIVITY_TASK_QUEUE:     "provisioning-queue"
+
+  # ── Orchestrator concurrency ──────────────────────────────────────────────
+  # Orchestrator pods run workflow logic only — high workflow task concurrency,
+  # no activities registered.
+  ORCHESTRATOR_MAX_CONCURRENT_WORKFLOW_TASKS: "100"
+  ORCHESTRATOR_MAX_CONCURRENT_ACTIVITIES:     "0"
+
+  # ── Activities worker concurrency ─────────────────────────────────────────
+  # Activities pods do the real work — tune to match pod CPU/memory limits.
+  # For async I/O-heavy activities (HTTP, DB) a high value is fine.
+  # For CPU-bound activities lower this and add more replicas instead.
+  ACTIVITIES_MAX_CONCURRENT_ACTIVITIES:     "20"
+  ACTIVITIES_MAX_CONCURRENT_WORKFLOW_TASKS: "0"
+
+  # ── Shutdown ──────────────────────────────────────────────────────────────
+  # Must be a few seconds less than terminationGracePeriodSeconds in Deployments.
+  GRACEFUL_SHUTDOWN_SECS: "45"

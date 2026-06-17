@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal-activities
+  namespace: temporal-workers
+  labels:
+    app: temporal-activities
+    worker-type: activities
+spec:
+  # Starting replica count. HPA will scale this between minReplicas and maxReplicas
+  # defined in activities-hpa.yaml based on CPU utilisation.
+  replicas: 3
+
+  selector:
+    matchLabels:
+      app: temporal-activities
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1   # allow 1 pod to be unavailable during rollout
+      maxSurge: 2         # spin up 2 extra pods before terminating old ones
+
+  template:
+    metadata:
+      labels:
+        app: temporal-activities
+        worker-type: activities
+
+    spec:
+      terminationGracePeriodSeconds: 60   # > GRACEFUL_SHUTDOWN_SECS
+
+      containers:
+        - name: worker
+          image: your-registry/temporal-worker:latest
+          imagePullPolicy: Always
+
+          env:
+            - name: WORKER_TYPE
+              value: "activities"     # only registers provisioning activities
+
+            - name: TASK_QUEUE
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: ACTIVITY_TASK_QUEUE    # polls "provisioning-queue"
+
+            - name: TEMPORAL_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: TEMPORAL_HOST
+
+            - name: TEMPORAL_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: TEMPORAL_NAMESPACE
+
+            - name: MAX_CONCURRENT_ACTIVITIES
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: ACTIVITIES_MAX_CONCURRENT_ACTIVITIES
+
+            - name: GRACEFUL_SHUTDOWN_SECS
+              valueFrom:
+                configMapKeyRef:
+                  name: temporal-worker-config
+                  key: GRACEFUL_SHUTDOWN_SECS
+
+          # Activities do the real work — provision servers, call cloud APIs, etc.
+          # Size these pods for the heaviest activity in the queue.
+          # If activities are purely async I/O (HTTP calls), you can keep CPU low
+          # and raise MAX_CONCURRENT_ACTIVITIES instead.
+          resources:
+            requests:
+              cpu:    "500m"
+              memory: "512Mi"
+            limits:
+              cpu:    "2"
+              memory: "2Gi"
+
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import sys; sys.exit(0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway    # best-effort spread for HPA scaling
+          labelSelector:
+            matchLabels:
+              app: temporal-activities
