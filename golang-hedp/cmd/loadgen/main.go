@@ -19,6 +19,8 @@ import (
 	"os"
 	"sort"
 	"time"
+
+	"github.com/sashaakr/research/golang-hedp/internal/library"
 )
 
 func main() {
@@ -60,9 +62,20 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 		concurrency = fs.Int("concurrency", 0, "server-side render concurrency (0 = server default)")
 		rounds      = fs.Int("rounds", 1, "how many times to send the request")
 		renderAll   = fs.Bool("all", false, "make every config render the entire library")
+		revision    = fs.String("revision", "", "render against this library revision (default: the server's default)")
+		pushDir     = fs.String("push", "", "pack this library directory and PUT it as -revision, then exit")
 	)
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
+	}
+
+	client := &http.Client{Timeout: 30 * time.Minute}
+
+	if *pushDir != "" {
+		if *revision == "" {
+			return fmt.Errorf("-push needs -revision to name the version")
+		}
+		return push(ctx, client, *addr, *revision, *pushDir, stdout)
 	}
 
 	body, err := json.Marshal(map[string]any{
@@ -74,18 +87,56 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "request: %d configs, %.1f KB body\n", *count, float64(len(body))/1024)
 
-	client := &http.Client{Timeout: 30 * time.Minute}
+	url := *addr + "/v1/render/bulk"
+	if *revision != "" {
+		url += "?revision=" + *revision
+	}
 
 	for round := 1; round <= *rounds; round++ {
-		if err := oneRound(ctx, client, *addr, body, round, stdout); err != nil {
+		if err := oneRound(ctx, client, url, body, round, stdout); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func oneRound(ctx context.Context, client *http.Client, addr string, body []byte, round int, stdout io.Writer) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, addr+"/v1/render/bulk", bytes.NewReader(body))
+// push packs a library directory and uploads it as a revision. It uses the
+// packed layout - one gzip stream per chart - because that is what the server
+// can decompress in parallel.
+func push(ctx context.Context, client *http.Client, addr, revision, dir string, stdout io.Writer) error {
+	start := time.Now()
+	data, err := library.PackFast(dir)
+	if err != nil {
+		return err
+	}
+	packed := time.Since(start)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
+		addr+"/v1/versions/"+revision, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	start = time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned %s: %s", resp.Status, body)
+	}
+
+	fmt.Fprintf(stdout, "packed %.1f MB in %v, uploaded and loaded in %v\n",
+		float64(len(data))/(1<<20), packed.Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
+	fmt.Fprintf(stdout, "%s\n", body)
+	return nil
+}
+
+func oneRound(ctx context.Context, client *http.Client, url string, body []byte, round int, stdout io.Writer) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

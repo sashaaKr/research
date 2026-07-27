@@ -10,14 +10,12 @@ import (
 	"net"
 	"net/http"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"syscall"
 	"time"
 
-	"github.com/sashaakr/research/golang-hedp/internal/blueprint"
-	"github.com/sashaakr/research/golang-hedp/internal/catalog"
+	"github.com/sashaakr/research/golang-hedp/internal/library"
 	"github.com/sashaakr/research/golang-hedp/internal/render"
 )
 
@@ -37,6 +35,8 @@ func Run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		bulkConc   = fs.Int("bulk-concurrency", envOrInt(getenv, "HEDP_BULK_CONCURRENCY", runtime.GOMAXPROCS(0)), "default customers rendered in parallel")
 		maxConfigs = fs.Int("max-configs", envOrInt(getenv, "HEDP_MAX_CONFIGS", 10000), "max customer configs per bulk request")
 		cacheSize  = fs.Int("cache", envOrInt(getenv, "HEDP_CACHE", 0), "render verdict cache size in entries (0 disables)")
+		revision   = fs.String("revision", envOr(getenv, "HEDP_REVISION", "local"), "revision name for the library loaded at startup")
+		budgetMB   = fs.Int("memory-budget-mb", envOrInt(getenv, "HEDP_MEMORY_BUDGET_MB", 2048), "heap budget across all resident library versions")
 		cached     = fs.Bool("cached-engine", envOr(getenv, "HEDP_CACHED_ENGINE", "") == "true", "parse charts once at startup instead of on every render")
 		strict     = fs.Bool("strict", envOr(getenv, "HEDP_STRICT", "") == "true", "treat unresolved template keys as errors")
 		timeout    = fs.Duration("timeout", 10*time.Minute, "per-request timeout")
@@ -47,26 +47,6 @@ func Run(ctx context.Context, args []string, getenv func(string) string, stdout,
 
 	logger := slog.New(slog.NewJSONHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	cat, err := catalog.Load(filepath.Join(*libraryDir, "charts"))
-	if err != nil {
-		return fmt.Errorf("load catalog: %w", err)
-	}
-	bp, err := blueprint.Load(filepath.Join(*libraryDir, "blueprint.yaml"))
-	if err != nil {
-		return fmt.Errorf("load blueprint: %w", err)
-	}
-
-	stats := cat.Stats()
-	logger.Info("chart library loaded",
-		"charts", stats.Charts,
-		"releases", len(bp.Releases),
-		"template_mb", stats.TemplateBytes>>20,
-		"files_mb", stats.FileBytes>>20,
-		"crd_mb", stats.CRDBytes>>20,
-		"total_mb", stats.TotalBytes>>20,
-		"load", stats.LoadDuration,
-	)
-
 	opts := render.Options{
 		MaxConcurrentRenders: *maxRenders,
 		ReleaseConcurrency:   *relConc,
@@ -76,16 +56,41 @@ func Run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	if *cacheSize > 0 {
 		opts.Cache = render.NewCache(*cacheSize)
 	}
-	renderer, err := render.New(cat, bp, opts)
-	if err != nil {
-		return fmt.Errorf("build renderer: %w", err)
+
+	// Versions live in RAM, keyed by revision, because a release set
+	// corresponds to a commit and a process should be able to serve several at
+	// once without a checkout per version.
+	reg := library.NewRegistry(library.Config{
+		MemoryBudget:  int64(*budgetMB) << 20,
+		RenderOptions: opts,
+	})
+
+	// The startup library, if there is one, is loaded from the directory
+	// rather than packed into a bundle first: reading files in parallel is
+	// several times faster than decompressing the same bytes on one core.
+	if *libraryDir != "" {
+		v, err := reg.LoadDirectory(*revision, *libraryDir)
+		if err != nil {
+			return fmt.Errorf("load startup library: %w", err)
+		}
+		stats := v.Catalog.Stats()
+		logger.Info("library version loaded",
+			"revision", v.Revision,
+			"charts", stats.Charts,
+			"releases", len(v.Blueprint.Releases),
+			"template_mb", stats.TemplateBytes>>20,
+			"files_mb", stats.FileBytes>>20,
+			"crd_mb", stats.CRDBytes>>20,
+			"total_mb", stats.TotalBytes>>20,
+			"footprint_mb", v.Footprint>>20,
+			"load_millis", v.LoadMillis,
+			"compile_millis", v.Renderer.CompileMillis,
+		)
+	} else {
+		logger.Info("started with no library; push one to PUT /v1/versions/{revision}")
 	}
 
-	if *cached {
-		logger.Info("charts precompiled", "millis", renderer.CompileMillis)
-	}
-
-	handler := NewServer(logger, cat, renderer, Config{
+	handler := NewServer(logger, reg, Config{
 		MaxConfigs:      *maxConfigs,
 		BulkConcurrency: *bulkConc,
 		RequestTimeout:  *timeout,

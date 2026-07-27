@@ -12,50 +12,48 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/sashaakr/research/golang-hedp/internal/blueprint"
 	"github.com/sashaakr/research/golang-hedp/internal/catalog"
+	"github.com/sashaakr/research/golang-hedp/internal/library"
 	"github.com/sashaakr/research/golang-hedp/internal/render"
 	"github.com/sashaakr/research/golang-hedp/internal/server"
 )
 
-func newTestServer(tb testing.TB) http.Handler {
+func libraryRoot(tb testing.TB) string {
 	tb.Helper()
-
 	dir, err := os.Getwd()
 	if err != nil {
 		tb.Fatal(err)
 	}
-	var root string
 	for i := 0; i < 5; i++ {
 		candidate := filepath.Join(dir, "testdata", "library")
 		if _, err := os.Stat(filepath.Join(candidate, "blueprint.yaml")); err == nil {
-			root = candidate
-			break
+			return candidate
 		}
 		dir = filepath.Dir(dir)
 	}
-	if root == "" {
-		tb.Skip("chart library not generated; run: go run ./cmd/chartgen")
-	}
+	tb.Skip("chart library not generated; run: go run ./cmd/chartgen")
+	return ""
+}
 
-	cat, err := catalog.Load(filepath.Join(root, "charts"))
-	if err != nil {
-		tb.Fatal(err)
-	}
-	bp, err := blueprint.Load(filepath.Join(root, "blueprint.yaml"))
-	if err != nil {
-		tb.Fatal(err)
-	}
-	renderer, err := render.New(cat, bp, render.Options{
-		ReleaseConcurrency: 1,
-		CachedEngine:       true,
+func newTestServer(tb testing.TB) http.Handler {
+	tb.Helper()
+	h, _ := newTestServerWithRegistry(tb)
+	return h
+}
+
+func newTestServerWithRegistry(tb testing.TB) (http.Handler, *library.Registry) {
+	tb.Helper()
+	root := libraryRoot(tb)
+
+	reg := library.NewRegistry(library.Config{
+		RenderOptions: render.Options{ReleaseConcurrency: 1, CachedEngine: true},
 	})
-	if err != nil {
+	if _, err := reg.LoadDirectory("rev-one", root); err != nil {
 		tb.Fatal(err)
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return server.NewServer(logger, cat, renderer, server.Config{MaxConfigs: 100})
+	return server.NewServer(logger, reg, server.Config{MaxConfigs: 100}), reg
 }
 
 func post(tb testing.TB, h http.Handler, path string, body any) *httptest.ResponseRecorder {
@@ -136,9 +134,15 @@ func TestRenderRejectsInvalidConfigWith422(t *testing.T) {
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("got %d, want 422: %s", rec.Code, rec.Body)
 	}
-	var resp render.Result
+	var resp struct {
+		Revision string `json:"revision"`
+		render.Result
+	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
+	}
+	if resp.Revision != "rev-one" {
+		t.Errorf("response revision is %q, want rev-one", resp.Revision)
 	}
 	if len(resp.Problems) < 3 {
 		t.Errorf("expected problems for id, tier and region, got %v", resp.Problems)
@@ -234,5 +238,162 @@ func TestUnknownFieldIsRejected(t *testing.T) {
 	})
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("got %d, want 400: %s", rec.Code, rec.Body)
+	}
+}
+
+// --- versioned libraries -----------------------------------------------------
+
+func TestUnknownRevisionIs404NotASilentFallback(t *testing.T) {
+	h := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/render?revision=deadbeef",
+		bytes.NewReader([]byte(`{"id":"acme","tier":"free","region":"eu-west-1"}`)))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// The entire point of pinning a revision is that the wrong charts are worse
+	// than no charts. Falling back to the default would render a different
+	// commit and report success.
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("got %d, want 404: %s", rec.Code, rec.Body)
+	}
+}
+
+func TestPushVersionThenRenderAgainstIt(t *testing.T) {
+	h, reg := newTestServerWithRegistry(t)
+
+	data, err := library.PackFast(libraryRoot(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/v1/versions/commit-abc", bytes.NewReader(data))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("push returned %d: %s", rec.Code, rec.Body)
+	}
+
+	var pushed struct {
+		Revision string        `json:"revision"`
+		Loaded   bool          `json:"loaded"`
+		Stats    library.Stats `json:"stats"`
+		Default  string        `json:"default"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &pushed); err != nil {
+		t.Fatal(err)
+	}
+	if !pushed.Loaded || pushed.Stats.Charts == 0 {
+		t.Fatalf("push reported nothing loaded: %+v", pushed)
+	}
+	// Pushing must not silently move the default.
+	if pushed.Default != "rev-one" {
+		t.Errorf("default moved to %q on push; it should stay rev-one", pushed.Default)
+	}
+
+	// The pushed revision renders.
+	req = httptest.NewRequest(http.MethodPost, "/v1/render?revision=commit-abc",
+		bytes.NewReader([]byte(`{"id":"acme","tier":"premium","region":"eu-west-1","features":["observability"]}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("render against pushed revision returned %d: %s", rec.Code, rec.Body)
+	}
+
+	var res struct {
+		Revision string `json:"revision"`
+		render.Result
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Revision != "commit-abc" || !res.OK || res.Manifests == 0 {
+		t.Fatalf("unexpected result: revision=%s ok=%v manifests=%d", res.Revision, res.OK, res.Manifests)
+	}
+
+	// Both revisions are resident and listed.
+	if _, _, count := reg.Usage(); count != 2 {
+		t.Errorf("%d versions resident, want 2", count)
+	}
+}
+
+func TestVersionLifecycleEndpoints(t *testing.T) {
+	h, _ := newTestServerWithRegistry(t)
+
+	data, err := library.PackFast(libraryRoot(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPut, "/v1/versions/v2", bytes.NewReader(data))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("push returned %d: %s", rec.Code, rec.Body)
+	}
+
+	// Promote it.
+	req = httptest.NewRequest(http.MethodPost, "/v1/versions/v2/default", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set-default returned %d: %s", rec.Code, rec.Body)
+	}
+
+	// An unqualified render now uses it.
+	rec = post(t, h, "/v1/render", map[string]any{"id": "acme", "tier": "free", "region": "eu-west-1"})
+	var res struct {
+		Revision string `json:"revision"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Revision != "v2" {
+		t.Errorf("unqualified render used %q, want v2", res.Revision)
+	}
+
+	// List reports both, with accounting.
+	req = httptest.NewRequest(http.MethodGet, "/v1/versions", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var list struct {
+		Default   string          `json:"default"`
+		Versions  []library.Stats `json:"versions"`
+		UsedBytes int64           `json:"used_bytes"`
+		Budget    int64           `json:"budget_bytes"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if list.Default != "v2" || len(list.Versions) != 2 {
+		t.Errorf("unexpected listing: default=%s versions=%d", list.Default, len(list.Versions))
+	}
+	if list.UsedBytes == 0 || list.UsedBytes > list.Budget {
+		t.Errorf("accounting looks wrong: used=%d budget=%d", list.UsedBytes, list.Budget)
+	}
+
+	// Evict the old one.
+	req = httptest.NewRequest(http.MethodDelete, "/v1/versions/rev-one", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete returned %d: %s", rec.Code, rec.Body)
+	}
+	req = httptest.NewRequest(http.MethodDelete, "/v1/versions/rev-one", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("deleting an absent revision returned %d, want 404", rec.Code)
+	}
+}
+
+func TestPushRejectsGarbageBundle(t *testing.T) {
+	h := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodPut, "/v1/versions/bad", bytes.NewReader([]byte("not a tar")))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("got %d, want 422: %s", rec.Code, rec.Body)
 	}
 }

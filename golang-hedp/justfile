@@ -42,6 +42,19 @@ bench-core:
 load configs="200":
     ./bin/loadgen -configs {{configs}}
 
+# Push a library directory as a versioned revision, no checkout on the server.
+push revision dir="testdata/library": build
+    ./bin/loadgen -revision {{revision}} -push {{dir}}
+
+# What revisions are resident and what they cost.
+versions:
+    curl -s localhost:8080/v1/versions | python3 -m json.tool
+
+# How a version becomes servable: directory vs bundle vs packed bundle,
+# and what a resident version costs in heap.
+bench-versions:
+    go test ./internal/library/ -run '^$' -bench . -benchtime 10x -timeout 30m
+
 profile:
     go test ./internal/render/ -run '^$' -bench 'BenchmarkEngine/helm/all' -benchtime 20x \
         -cpuprofile cpu.prof -memprofile mem.prof -timeout 30m

@@ -6,8 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/sashaakr/research/golang-hedp/internal/catalog"
-	"github.com/sashaakr/research/golang-hedp/internal/render"
+	"github.com/sashaakr/research/golang-hedp/internal/library"
 )
 
 // Config holds the server's request-shaping limits. They exist because this is
@@ -23,6 +22,8 @@ type Config struct {
 	// RequestTimeout bounds a single request. A full-library render for
 	// thousands of customers is minutes of CPU, so the default is generous.
 	RequestTimeout time.Duration
+	// MaxBundleBytes caps an uploaded library version.
+	MaxBundleBytes int64
 }
 
 func (c Config) withDefaults() Config {
@@ -35,16 +36,19 @@ func (c Config) withDefaults() Config {
 	if c.RequestTimeout <= 0 {
 		c.RequestTimeout = 10 * time.Minute
 	}
+	if c.MaxBundleBytes <= 0 {
+		c.MaxBundleBytes = 512 << 20
+	}
 	return c
 }
 
 // NewServer wires the routes and middleware and returns the whole service as
 // one http.Handler.
-func NewServer(logger *slog.Logger, cat *catalog.Catalog, renderer *render.Renderer, cfg Config) http.Handler {
+func NewServer(logger *slog.Logger, reg *library.Registry, cfg Config) http.Handler {
 	cfg = cfg.withDefaults()
 
 	mux := http.NewServeMux()
-	addRoutes(mux, logger, cat, renderer, cfg)
+	addRoutes(mux, logger, reg, cfg)
 
 	var handler http.Handler = mux
 	handler = requestLogger(logger, handler)

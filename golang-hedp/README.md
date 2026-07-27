@@ -61,7 +61,8 @@ cmd/chartgen    generates the synthetic 55 MB chart library + blueprint
 cmd/hedp        the HTTP service
 cmd/loadgen     drives the bulk API and reports client-observed latency
 
-internal/catalog       loads every chart into memory once, at startup
+internal/catalog       loads charts into memory, from a directory or a bundle
+internal/library       several revisions resident at once, keyed by commit
 internal/blueprint     the release graph: gates, edges, exports, topo waves
 internal/customer      the input type and its validation rules
 internal/render        planning, wave scheduling, bulk fan-out, verdict cache
@@ -98,6 +99,10 @@ curl -s -X POST 'localhost:8080/v1/render?manifests=true' -d '{...}'
 curl -s -X POST localhost:8080/v1/render/bulk \
   -d '{"configs":[{...},{...}],"concurrency":4}'
 ```
+
+Every rendering endpoint takes `?revision=<sha>` to pin the release set to a
+commit; without it they use the registry's default. See
+[Versioned release sets](#versioned-release-sets-held-in-ram).
 
 ## Benchmark results
 
@@ -232,9 +237,112 @@ Three things worth noting:
   the streaming design doing its job; buffering a JSON array instead would have
   needed the batch to fit in memory.
 
+## Versioned release sets, held in RAM
+
+A release set corresponds to a commit, so a request has to render against the
+charts *as they were at that revision*. The service keeps several revisions
+resident at once, keyed by revision, and never touches the filesystem to serve
+one.
+
+```sh
+# Push a revision as a bundle. No checkout involved on the server.
+loadgen -revision 9f3c1ab -push ./library
+
+# Render against it explicitly
+curl -X POST 'localhost:8080/v1/render?revision=9f3c1ab' -d '{...}'
+
+# What is resident, and what it costs
+curl -s localhost:8080/v1/versions
+
+curl -X POST localhost:8080/v1/versions/9f3c1ab/default
+curl -X DELETE localhost:8080/v1/versions/old-sha
+```
+
+Naming a revision that is not resident is a **404, never a fallback to the
+default**. A service whose entire purpose is "render exactly commit X" must not
+quietly render commit Y and report success.
+
+### Rendering was already entirely in RAM
+
+Worth stating plainly, because it is the first thing to check: charts are read
+from disk **once at startup** and rendering never goes near the filesystem
+again. A `*chart.Chart` holds every template and file as `[]byte` in the heap,
+and `engine.Render` only ever walks those. There is no per-request I/O to
+remove, so there is no rendering speedup available from "keep it in RAM" - that
+was already banked in the first version of this service.
+
+What the in-memory path actually buys is the versioning above: a bundle can be
+fetched from git, an OCI registry or an object store and loaded straight out of
+the byte slice it arrived in (`loader.LoadFiles` / `loader.LoadArchive`), so N
+revisions cost N heap allocations instead of N checkouts.
+
+### Loading a version: the numbers
+
+| source | time | notes |
+|---|---|---|
+| Directory (`catalog.Load`) | **17 ms** | 814 files from page cache, read in parallel |
+| Bundle, one gzip for the whole library | 192 ms | decompression pinned to one core |
+| Bundle, one gzip per chart | **77 ms** | decompression spread across cores |
+
+The bundle path is *slower* than reading a checkout, not faster - which is the
+opposite of what "keep it in RAM" suggests. Page-cache reads parallelise across
+goroutines; a single gzip stream cannot be parallelised at all. Isolating it
+confirmed the cause: **87% of the naive bundle's load time is gunzip** (169 ms
+of 192 ms).
+
+Hence the packed layout - an uncompressed outer tar holding one `.tgz` per
+chart, which is also Helm's native packaging. One stream per chart means
+decompression scales with cores, and compressing already-compressed charts was
+never buying anything. That is 2.5x, and `catalog.LoadBundle` accepts either
+layout.
+
+None of this is in the request path. It is what a "load this commit" call
+costs, once per revision.
+
+### Memory per resident version
+
+| | measured heap | registry estimate |
+|---|---|---|
+| Charts only (55 MB raw) | 58.6 MB | 60.5 MB |
+| Charts + compiled templates | 133.5 MB | 137.5 MB |
+
+So a version costs roughly **1.07x its raw size**, or **2.4x with
+`-cached-engine`** - the parsed template trees are not free. The estimator the
+registry uses for admission control is within 3% of measured, which is what
+makes the memory budget trustworthy rather than decorative.
+
+At ~134 MB a version, a 4 GB budget holds about 30 revisions; charts-only, ~68.
+Set it with `-memory-budget-mb`.
+
+Two caveats on that number:
+
+- **It accounts for resident library data, not process RSS.** Rendering churns
+  a lot of short-lived memory: with two versions resident (275 MB of libraries)
+  and 200 configs in flight, RSS peaked at 925 MB. Size the container for the
+  render working set, not just the budget.
+- **A bundle is 13.4 MB on the wire** against 55 MB raw, so shipping revisions
+  around is cheap even though holding them is not.
+
+### Eviction
+
+Least-recently-used, bounded by the memory budget, with two deliberate rules:
+
+- **The default revision is never evicted.** Dropping it would silently
+  redirect every unqualified request to a different commit.
+- **A load that cannot fit is refused with an error**, not admitted over
+  budget. An early version of this quietly exceeded the limit whenever the
+  pinned default left too little room - a budget you silently exceed is not a
+  budget, and the operator finds out from the OOM killer instead of from an
+  error message. It now says exactly what is pinned and by how much it is
+  short.
+
+Concurrent loads of the same cold revision collapse into one: at ~134 MB
+apiece, a burst of requests for a revision that is not resident must not each
+load their own copy.
+
 ## Design notes
 
-**Charts are loaded once and shared by every goroutine.** Helm deep-copies
+**Charts are loaded once per revision and shared by every goroutine.** Helm deep-copies
 chart values before touching them (`chartutil.coalesceValues`) and template
 execution does not mutate parse trees, so a `*chart.Chart` is safe to render
 concurrently. `TestConcurrentRendersAreSafe` pins this down under `-race`;

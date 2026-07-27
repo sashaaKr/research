@@ -54,6 +54,12 @@ func Load(path string) (*Blueprint, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read blueprint: %w", err)
 	}
+	return Parse(data)
+}
+
+// Parse validates a blueprint that is already in memory - the path taken when
+// a versioned release set arrives as a bundle rather than a directory.
+func Parse(data []byte) (*Blueprint, error) {
 	var bp Blueprint
 	if err := yaml.Unmarshal(data, &bp); err != nil {
 		return nil, fmt.Errorf("parse blueprint: %w", err)
