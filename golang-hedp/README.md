@@ -12,13 +12,18 @@ cost?**
 
 On 4 vCPUs, with a 55 MB library of 40 charts and 40 releases:
 
-| | stock Helm engine | charts parsed once |
+| | stock Helm engine | tuned |
 |---|---|---|
-| One typical customer (24 releases, 225 manifests, 10.5 MB out) | **153 ms** | **73 ms** |
-| One customer, entire library (40 releases, 382 manifests, 18.5 MB out) | **274 ms** | **124 ms** |
-| Bulk throughput, 4 cores | **19 configs/s** | **44 configs/s** |
-| A 1,000-config bulk request | **~53 s** | **~23 s** |
-| A 4,000-config bulk request | **~3.5 min** | **~1.5 min** |
+| One typical customer (24 releases, 225 manifests, 10.5 MB out) | 153 ms | **40 ms** |
+| One customer, entire library (40 releases, 382 manifests, 18.5 MB out) | 274 ms | **69 ms** |
+| Bulk throughput | 19 configs/s | **~10 configs/s/core** |
+| A 1,000-config bulk request | ~53 s | **23-32 s** |
+| A 4,000-config bulk request | ~3.5 min | **1.5-2 min** |
+
+"Tuned" is `-cached-engine` plus `GOGC=400`, and for the single-request rows
+`-release-concurrency 4`. See [Capacity planning](#capacity-planning-what-to-actually-expect)
+for the full picture, including a ±30% hardware variance band that this study
+ran into first-hand.
 
 Three findings drove every design decision here:
 
@@ -395,6 +400,102 @@ genuinely distinct customers, and no amount of tuning changes that.
 Do not read a warm-cache benchmark as a throughput number. Replaying the same
 batch into an already-full cache measures the cache, not the service; the
 figures above reset the cache before every iteration for that reason.
+
+## Capacity planning: what to actually expect
+
+### A note on variance first
+
+This container was rescheduled onto different hardware mid-study (Xeon 2.10GHz
+then 2.80GHz, 4 vCPU both times), and the second machine ran **25-30% slower**
+on identical code despite the higher nominal clock - shared, contended
+hardware. Every ratio below reproduced across both machines. Every absolute
+number should be read with a ±30% band until measured on your own hardware.
+The per-core figures are the portable ones.
+
+### Expected latency, single request
+
+Latency-tuned (`-cached-engine -release-concurrency 4`), measured over HTTP on
+the slower machine, so treat these as the pessimistic end:
+
+| request | releases | rendered | latency |
+|---|---|---|---|
+| typical customer | 24 | 10.5 MB | **40 ms** |
+| heavy customer | 33 | 13.9 MB | **66 ms** |
+| entire library | 40 | 18.5 MB | **69 ms** |
+
+**Any single customer renders in under 100 ms**, and the spread between a small
+customer and the whole library is under 2x. Validation-only rejection (bad
+tier, unknown feature) returns in well under a millisecond, because nothing
+renders.
+
+Throughput-tuned (`-release-concurrency 1`), the same requests cost 112 / 150 /
+156 ms median. That is the trade: serial releases free the cores for other
+customers.
+
+### Expected latency, bulk request
+
+Bulk is throughput-bound, so wall time is just `configs / throughput`:
+
+| batch | 4 cores | 16 cores (projected) |
+|---|---|---|
+| 100 | ~3 s | ~1 s |
+| 1,000 | **23-32 s** | ~7-9 s |
+| 4,000 | **91-128 s** | ~26-36 s |
+| 10,000 (the API cap) | ~4-5 min | ~65-90 s |
+
+Per-customer latency *within* a batch is p50 ~90-100 ms, p95 ~150-310 ms,
+p99 ~170-450 ms depending on machine contention. Those were flat from 200 to
+1,000 configs - batch size does not degrade them - and time-to-first-result
+stays around 600 ms regardless, because results stream.
+
+### The upper bound, and what sets it
+
+**~8-11 customer configs per second per core.** That is the number to plan
+with. On 4 cores: 31-44 configs/s measured end to end.
+
+Three things bound it, in order:
+
+1. **Allocation rate.** A typical customer allocates **67 MB** and the full
+   library **116 MB**, even with the cached engine. At 40 configs/s that is
+   ~2.7 GB/s of garbage. This, not template execution, is what will stop the
+   service scaling linearly with cores.
+2. **Parallel efficiency.** Measured scaling was 1.93x at 2 cores and 3.11x at
+   4 - about **78% efficiency** - and past `GOMAXPROCS` throughput *falls*.
+   The 16-core projections above assume that efficiency holds; they are the
+   least trustworthy numbers on this page, because allocation bandwidth gets
+   worse with core count, not better.
+3. **Output size.** ~15 ms per MB of rendered manifests. A customer's latency
+   tracks what they render, not the size of the library.
+
+### Set GOGC
+
+Because the workload is allocation-heavy, the Go default (`GOGC=100`) spends a
+quarter of the machine collecting:
+
+| GOGC | bulk throughput | p99 |
+|---|---|---|
+| 100 (default) | 31.2 configs/s | 219 ms |
+| 400 | 38.7 configs/s | 188 ms |
+| 800 | **39.8 configs/s** | **170 ms** |
+
+**`GOGC=400` buys 24% for free**, 800 a little more with diminishing returns.
+The cost is heap headroom, which this service has: it is holding immutable
+chart data, not growing. Pair it with `GOMEMLIMIT` set to the container limit
+so the collector still has a hard backstop.
+
+### Sizing a box
+
+For a target of *R* configs/second:
+
+- **Cores**: `R / 10`, plus headroom - the service saturates at `GOMAXPROCS`.
+- **Memory**: `(resident versions x 134 MB) + (concurrent renders x ~150 MB
+  working set) + GOGC headroom`. With 3 revisions resident and 4-way
+  concurrency, 4 GB is comfortable and 2 GB is tight. Observed RSS was 925 MB
+  with 2 revisions and 200 configs in flight.
+- **Horizontally**: the service is stateless per request once versions are
+  loaded, so N replicas give N times the throughput. Push each revision to
+  every replica, or let them pull on first miss - the load dedup already
+  handles a burst of concurrent misses.
 
 ## Extrapolating
 

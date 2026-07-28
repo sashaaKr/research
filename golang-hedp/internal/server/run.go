@@ -90,6 +90,14 @@ func Run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		logger.Info("started with no library; push one to PUT /v1/versions/{revision}")
 	}
 
+	// Rendering allocates ~67 MB per typical customer, so the Go default of
+	// GOGC=100 spends about a quarter of the machine collecting. Measured:
+	// GOGC=400 is worth 24% throughput here. Say so rather than overriding it,
+	// since the right value depends on the container's memory limit.
+	if getenv("GOGC") == "" {
+		logger.Info("GOGC is unset; this workload is allocation-heavy and GOGC=400 measured ~24% faster (pair with GOMEMLIMIT)")
+	}
+
 	handler := NewServer(logger, reg, Config{
 		MaxConfigs:      *maxConfigs,
 		BulkConcurrency: *bulkConc,

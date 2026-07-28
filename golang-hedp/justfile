@@ -26,9 +26,20 @@ verify:
 serve: build
     ./bin/hedp -addr 127.0.0.1:8080 -library testdata/library
 
-# Serve with charts parsed once at startup.
+# Serve with charts parsed once at startup, tuned for bulk throughput.
 serve-fast: build
-    ./bin/hedp -addr 127.0.0.1:8080 -library testdata/library -cached-engine
+    GOGC=400 ./bin/hedp -addr 127.0.0.1:8080 -library testdata/library -cached-engine
+
+# Tuned for single-request latency instead: releases within one customer render
+# in parallel. Costs throughput under bulk load.
+serve-lowlatency: build
+    GOGC=400 ./bin/hedp -addr 127.0.0.1:8080 -library testdata/library -cached-engine -release-concurrency 4
+
+# What GC tuning is worth on this workload.
+bench-gc:
+    for g in 100 400 800; do echo "GOGC=$g"; \
+        GOGC=$g go test ./internal/render/ -run '^$' -bench 'BenchmarkBulkEngine/cached' -benchtime 3x -timeout 30m | grep BulkEngine; \
+    done
 
 bench:
     go test ./internal/render/ -run '^$' -bench . -benchtime 5x -timeout 60m

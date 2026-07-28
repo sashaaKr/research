@@ -104,20 +104,27 @@ func BenchmarkReleaseConcurrency(b *testing.B) {
 		ID: "bench-conc", Tier: "premium", Region: "us-east-1", RenderAll: true,
 	}
 
-	for _, width := range []int{1, 2, 4, 8} {
-		b.Run(fmt.Sprintf("width=%d", width), func(b *testing.B) {
-			r := newRenderer(b, render.Options{
-				ReleaseConcurrency:   width,
-				MaxConcurrentRenders: width,
-			})
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				if res := r.Render(ctx, cfg); !res.OK {
-					b.Fatalf("render failed: %s", firstError(res))
+	for _, cached := range []bool{false, true} {
+		engineName := "helm"
+		if cached {
+			engineName = "cached"
+		}
+		for _, width := range []int{1, 2, 4, 8} {
+			b.Run(fmt.Sprintf("%s/width=%d", engineName, width), func(b *testing.B) {
+				r := newRenderer(b, render.Options{
+					ReleaseConcurrency:   width,
+					MaxConcurrentRenders: width,
+					CachedEngine:         cached,
+				})
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if res := r.Render(ctx, cfg); !res.OK {
+						b.Fatalf("render failed: %s", firstError(res))
+					}
 				}
-			}
-		})
+			})
+		}
 	}
 }
 
