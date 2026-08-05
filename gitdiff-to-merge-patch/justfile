@@ -1,0 +1,20 @@
+default: test
+
+build:
+    go build ./...
+
+test:
+    go test ./...
+
+vet:
+    go vet ./...
+
+fmt:
+    gofmt -l -w .
+
+check: fmt vet test
+
+# Print a sync plan for a repository. Example:
+#   just plan /path/to/repo origin/main HEAD config /api/v1
+plan dir base head root prefix:
+    go run ./cmd/gitsync -dir {{dir}} -base {{base}} -head {{head}} -root {{root}} -prefix {{prefix}} -format summary
