@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/sashaakr/research/golang-hedp/internal/library"
@@ -64,6 +65,8 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 		renderAll   = fs.Bool("all", false, "make every config render the entire library")
 		revision    = fs.String("revision", "", "render against this library revision (default: the server's default)")
 		pushDir     = fs.String("push", "", "pack this library directory and PUT it as -revision, then exit")
+		chunk       = fs.Int("chunk", 0, "split -configs into requests of this size (0 = one request)")
+		clients     = fs.Int("clients", 1, "send chunks from this many concurrent clients")
 	)
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -78,22 +81,34 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 		return push(ctx, client, *addr, *revision, *pushDir, stdout)
 	}
 
-	body, err := json.Marshal(map[string]any{
-		"configs":     buildConfigs(*count, *renderAll),
-		"concurrency": *concurrency,
-	})
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(stdout, "request: %d configs, %.1f KB body\n", *count, float64(len(body))/1024)
-
 	url := *addr + "/v1/render/bulk"
 	if *revision != "" {
 		url += "?revision=" + *revision
 	}
 
+	all := buildConfigs(*count, *renderAll)
+	size := *chunk
+	if size <= 0 || size > len(all) {
+		size = len(all)
+	}
+
+	var bodies [][]byte
+	for start := 0; start < len(all); start += size {
+		end := min(start+size, len(all))
+		b, err := json.Marshal(map[string]any{
+			"configs":     all[start:end],
+			"concurrency": *concurrency,
+		})
+		if err != nil {
+			return err
+		}
+		bodies = append(bodies, b)
+	}
+	fmt.Fprintf(stdout, "%d configs in %d chunk(s) of %d, %d concurrent client(s)\n",
+		len(all), len(bodies), size, *clients)
+
 	for round := 1; round <= *rounds; round++ {
-		if err := oneRound(ctx, client, url, body, round, stdout); err != nil {
+		if err := oneRound(ctx, client, url, bodies, *clients, round, stdout); err != nil {
 			return err
 		}
 	}
@@ -135,14 +150,94 @@ func push(ctx context.Context, client *http.Client, addr, revision, dir string, 
 	return nil
 }
 
-func oneRound(ctx context.Context, client *http.Client, url string, body []byte, round int, stdout io.Writer) error {
+// roundStats aggregates one round across every chunk and client.
+type roundStats struct {
+	mu           sync.Mutex
+	latencies    []int64
+	results      int
+	failures     int
+	manifests    int
+	renderedByte int64
+	firstResult  time.Duration
+	chunkWall    []time.Duration
+}
+
+// oneRound sends every chunk, spread over the requested number of concurrent
+// clients, and reports the aggregate. This is the client-side model of running
+// behind a Kubernetes Service: each chunk is an independent request that any
+// replica can answer.
+func oneRound(ctx context.Context, client *http.Client, url string, bodies [][]byte, clients int, round int, stdout io.Writer) error {
+	if clients < 1 {
+		clients = 1
+	}
+	start := time.Now()
+
+	stats := &roundStats{firstResult: -1}
+	jobs := make(chan []byte)
+	errCh := make(chan error, clients)
+
+	var wg sync.WaitGroup
+	for i := 0; i < clients; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for body := range jobs {
+				if err := sendChunk(ctx, client, url, body, start, stats); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+	for _, b := range bodies {
+		select {
+		case jobs <- b:
+		case <-ctx.Done():
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		return err
+	default:
+	}
+
+	total := time.Since(start)
+	sort.Slice(stats.latencies, func(i, j int) bool { return stats.latencies[i] < stats.latencies[j] })
+
+	fmt.Fprintf(stdout, "\nround %d\n", round)
+	fmt.Fprintf(stdout, "  wall clock        %v\n", total.Round(time.Millisecond))
+	fmt.Fprintf(stdout, "  first result      %v\n", stats.firstResult.Round(time.Millisecond))
+	fmt.Fprintf(stdout, "  results           %d (%d failed)\n", stats.results, stats.failures)
+	fmt.Fprintf(stdout, "  throughput        %.1f configs/s\n", float64(stats.results)/total.Seconds())
+	fmt.Fprintf(stdout, "  manifests         %d\n", stats.manifests)
+	fmt.Fprintf(stdout, "  rendered          %.1f MB (%.1f MB/s)\n",
+		float64(stats.renderedByte)/(1<<20), float64(stats.renderedByte)/(1<<20)/total.Seconds())
+	fmt.Fprintf(stdout, "  per-config p50    %s\n", ms(pct(stats.latencies, 0.50)))
+	fmt.Fprintf(stdout, "  per-config p95    %s\n", ms(pct(stats.latencies, 0.95)))
+	fmt.Fprintf(stdout, "  per-config p99    %s\n", ms(pct(stats.latencies, 0.99)))
+	if len(stats.chunkWall) > 0 {
+		sort.Slice(stats.chunkWall, func(i, j int) bool { return stats.chunkWall[i] < stats.chunkWall[j] })
+		fmt.Fprintf(stdout, "  chunk wall p50    %v\n", stats.chunkWall[len(stats.chunkWall)/2].Round(time.Millisecond))
+		fmt.Fprintf(stdout, "  chunk wall max    %v\n", stats.chunkWall[len(stats.chunkWall)-1].Round(time.Millisecond))
+	}
+	return nil
+}
+
+func sendChunk(ctx context.Context, client *http.Client, url string, body []byte, roundStart time.Time, stats *roundStats) error {
+	chunkStart := time.Now()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -154,19 +249,9 @@ func oneRound(ctx context.Context, client *http.Client, url string, body []byte,
 		return fmt.Errorf("server returned %s: %s", resp.Status, msg)
 	}
 
-	var (
-		first        time.Duration
-		latencies    []int64
-		results      int
-		failures     int
-		manifests    int
-		renderedByte int64
-		summaryRaw   json.RawMessage
-	)
-
-	// The response is NDJSON, so the client can account for time-to-first-result
-	// separately from total time. On a batch that takes a minute, those are
-	// very different numbers and only one of them is the user's experience.
+	// The response is NDJSON, so time-to-first-result is separable from total
+	// time. On a chunk that takes seconds those are very different numbers and
+	// only one of them is what a caller waits for.
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 1<<20), 64<<20)
 	for scanner.Scan() {
@@ -174,50 +259,33 @@ func oneRound(ctx context.Context, client *http.Client, url string, body []byte,
 		if err := json.Unmarshal(scanner.Bytes(), &env); err != nil {
 			return fmt.Errorf("decode stream: %w", err)
 		}
-		switch env.Type {
-		case "result":
-			if first == 0 {
-				first = time.Since(start)
-			}
-			var r result
-			if err := json.Unmarshal(env.Result, &r); err != nil {
-				return err
-			}
-			results++
-			if !r.OK {
-				failures++
-			}
-			manifests += r.Manifests
-			renderedByte += int64(r.TotalBytes)
-			latencies = append(latencies, r.Micros)
-		case "summary":
-			summaryRaw = env.Summary
+		if env.Type != "result" {
+			continue
 		}
+		var r result
+		if err := json.Unmarshal(env.Result, &r); err != nil {
+			return err
+		}
+		stats.mu.Lock()
+		if stats.firstResult < 0 {
+			stats.firstResult = time.Since(roundStart)
+		}
+		stats.results++
+		if !r.OK {
+			stats.failures++
+		}
+		stats.manifests += r.Manifests
+		stats.renderedByte += int64(r.TotalBytes)
+		stats.latencies = append(stats.latencies, r.Micros)
+		stats.mu.Unlock()
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("read stream: %w", err)
 	}
 
-	total := time.Since(start)
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-
-	fmt.Fprintf(stdout, "\nround %d\n", round)
-	fmt.Fprintf(stdout, "  wall clock        %v\n", total.Round(time.Millisecond))
-	fmt.Fprintf(stdout, "  first result      %v\n", first.Round(time.Millisecond))
-	fmt.Fprintf(stdout, "  results           %d (%d failed)\n", results, failures)
-	fmt.Fprintf(stdout, "  throughput        %.1f configs/s\n", float64(results)/total.Seconds())
-	fmt.Fprintf(stdout, "  manifests         %d\n", manifests)
-	fmt.Fprintf(stdout, "  rendered          %.1f MB (%.1f MB/s)\n",
-		float64(renderedByte)/(1<<20), float64(renderedByte)/(1<<20)/total.Seconds())
-	fmt.Fprintf(stdout, "  server-side p50   %s\n", ms(pct(latencies, 0.50)))
-	fmt.Fprintf(stdout, "  server-side p95   %s\n", ms(pct(latencies, 0.95)))
-	fmt.Fprintf(stdout, "  server-side p99   %s\n", ms(pct(latencies, 0.99)))
-	if len(latencies) > 0 {
-		fmt.Fprintf(stdout, "  server-side max   %s\n", ms(latencies[len(latencies)-1]))
-	}
-	if len(summaryRaw) > 0 {
-		fmt.Fprintf(stdout, "  server summary    %s\n", summaryRaw)
-	}
+	stats.mu.Lock()
+	stats.chunkWall = append(stats.chunkWall, time.Since(chunkStart))
+	stats.mu.Unlock()
 	return nil
 }
 

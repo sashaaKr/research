@@ -106,9 +106,14 @@ type Registry struct {
 	// and an OOM.
 	loading map[string]*loadGate
 
+	// fetching gates in-flight pulls, so a burst of misses for one revision
+	// downloads it once rather than once per caller.
+	fetching map[string]*loadGate
+
 	budget   int64
 	opts     render.Options
 	fallback string
+	fetcher  Fetcher
 }
 
 type loadGate struct {
@@ -124,6 +129,10 @@ type Config struct {
 	MemoryBudget int64
 	// RenderOptions are applied to every version's renderer.
 	RenderOptions render.Options
+	// Fetcher, if set, lets the registry pull a revision it does not hold.
+	// Required for horizontal scaling: replicas behind a load balancer cannot
+	// be pushed a version, they have to resolve it themselves.
+	Fetcher Fetcher
 }
 
 // NewRegistry returns an empty registry.
@@ -134,9 +143,23 @@ func NewRegistry(cfg Config) *Registry {
 	return &Registry{
 		versions: map[string]*Version{},
 		loading:  map[string]*loadGate{},
+		fetching: map[string]*loadGate{},
 		budget:   cfg.MemoryBudget,
 		opts:     cfg.RenderOptions,
+		fetcher:  cfg.Fetcher,
 	}
+}
+
+// CanFetch reports whether the registry can pull revisions it does not hold.
+func (r *Registry) CanFetch() bool { return r.fetcher != nil }
+
+// Ready reports whether the registry can serve an unqualified request. A pod
+// with no resident version must fail its readiness probe rather than take
+// traffic it will only reject.
+func (r *Registry) Ready() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.fallback != "" && r.versions[r.fallback] != nil
 }
 
 // Get returns a resident version and marks it used.

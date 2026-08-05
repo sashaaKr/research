@@ -9,6 +9,7 @@ import (
 
 func addRoutes(mux *http.ServeMux, logger *slog.Logger, reg *library.Registry, cfg Config) {
 	mux.Handle("GET /healthz", handleHealth())
+	mux.Handle("GET /readyz", handleReady(reg))
 
 	// Rendering. Every one of these takes ?revision=<sha>; without it they use
 	// the registry's default.

@@ -24,6 +24,13 @@ type Config struct {
 	RequestTimeout time.Duration
 	// MaxBundleBytes caps an uploaded library version.
 	MaxBundleBytes int64
+	// MaxInFlight caps concurrent render requests per process, shedding the
+	// rest with 503 + Retry-After. A saturated pod gains no throughput from
+	// extra concurrency and loses latency proportionally, so refusing lets the
+	// load balancer route to a replica that can actually help. 0 disables.
+	MaxInFlight int
+	// RetryAfterSeconds is the Retry-After hint on a shed request.
+	RetryAfterSeconds int
 }
 
 func (c Config) withDefaults() Config {
@@ -39,6 +46,9 @@ func (c Config) withDefaults() Config {
 	if c.MaxBundleBytes <= 0 {
 		c.MaxBundleBytes = 512 << 20
 	}
+	if c.RetryAfterSeconds <= 0 {
+		c.RetryAfterSeconds = 1
+	}
 	return c
 }
 
@@ -51,6 +61,7 @@ func NewServer(logger *slog.Logger, reg *library.Registry, cfg Config) http.Hand
 	addRoutes(mux, logger, reg, cfg)
 
 	var handler http.Handler = mux
+	handler = limitInFlight(cfg.MaxInFlight, cfg.RetryAfterSeconds, handler)
 	handler = requestLogger(logger, handler)
 	handler = recoverPanics(logger, handler)
 	return handler

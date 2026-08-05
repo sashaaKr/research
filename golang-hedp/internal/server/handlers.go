@@ -16,9 +16,39 @@ import (
 	"github.com/sashaakr/research/golang-hedp/internal/render"
 )
 
+// handleHealth is the liveness probe: is the process running. It must not
+// depend on library state, or a pod that is merely waiting for its first
+// version gets killed and restarted forever.
 func handleHealth() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		encode(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+}
+
+// handleReady is the readiness probe: can this pod actually serve a render.
+//
+// A pod with no resident version answers 503 on every request, so it must not
+// be in the Service's endpoint list. Without this gate a rolling update sends
+// traffic to pods that are still pulling their bundle, and a deploy shows up
+// as a burst of errors rather than as a slightly slower rollout.
+func handleReady(reg *library.Registry) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !reg.Ready() {
+			encode(w, http.StatusServiceUnavailable, map[string]any{
+				"status": "no library version resident",
+				"ready":  false,
+			})
+			return
+		}
+		used, budget, count := reg.Usage()
+		encode(w, http.StatusOK, map[string]any{
+			"status":    "ok",
+			"ready":     true,
+			"default":   reg.DefaultRevision(),
+			"versions":  count,
+			"used_mb":   used >> 20,
+			"budget_mb": budget >> 20,
+		})
 	})
 }
 

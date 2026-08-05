@@ -57,6 +57,20 @@ load configs="200":
 push revision dir="testdata/library": build
     ./bin/loadgen -revision {{revision}} -push {{dir}}
 
+# How chunk size and client concurrency behave against one pod - the two
+# measurements that decide the Kubernetes topology. Needs a running service.
+bench-topology:
+    @echo "chunk size sweep (1000 configs, 1 client):"
+    @for c in 10 25 50 100 250 1000; do \
+        printf "  chunk=%-5s " $c; \
+        ./bin/loadgen -configs 1000 -chunk $c | grep -E 'throughput|chunk wall p50' | tr -s ' ' | tr '\n' ' '; echo; \
+    done
+    @echo "client concurrency sweep (1000 configs, chunk=100):"
+    @for n in 1 2 4 8; do \
+        printf "  clients=%-3s " $n; \
+        ./bin/loadgen -configs 1000 -chunk 100 -clients $n | grep -E 'throughput|per-config p50' | tr -s ' ' | tr '\n' ' '; echo; \
+    done
+
 # What revisions are resident and what they cost.
 versions:
     curl -s localhost:8080/v1/versions | python3 -m json.tool

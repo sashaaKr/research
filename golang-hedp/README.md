@@ -345,6 +345,27 @@ Concurrent loads of the same cold revision collapse into one: at ~134 MB
 apiece, a burst of requests for a revision that is not resident must not each
 load their own copy.
 
+## Running more than one replica
+
+Two measurements shape the Kubernetes design, and they point the same way:
+
+- **Chunking a bulk request is free above ~100 configs** (-1% throughput at
+  100, -0.3% at 250). Ten 2.6-second requests cost the same as one 26-second
+  request, and survive ingress timeouts and rolling updates that the long one
+  does not.
+- **One pod is saturated by one client.** Throughput is flat at ~39 configs/s
+  from 1 to 8 concurrent callers, while per-config p50 rises 97 ms -> 747 ms.
+  Concurrency has to go *across* pods; piling it into one buys nothing.
+
+So: stateless replicas, clients chunk and retry, no coordinator and no queue.
+The service sheds beyond `-max-in-flight` with 503 + `Retry-After` so the load
+balancer routes to a replica that can actually help, and pods **pull** revisions
+from an artifact store (`-bundle-url`) rather than being pushed them - a PUT
+behind a Service reaches exactly one replica.
+
+Full write-up, including probes, HPA, GOGC and a reference manifest:
+**[DEPLOYMENT.md](DEPLOYMENT.md)**.
+
 ## Design notes
 
 **Charts are loaded once per revision and shared by every goroutine.** Helm deep-copies

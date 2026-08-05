@@ -37,6 +37,8 @@ func Run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		cacheSize  = fs.Int("cache", envOrInt(getenv, "HEDP_CACHE", 0), "render verdict cache size in entries (0 disables)")
 		revision   = fs.String("revision", envOr(getenv, "HEDP_REVISION", "local"), "revision name for the library loaded at startup")
 		budgetMB   = fs.Int("memory-budget-mb", envOrInt(getenv, "HEDP_MEMORY_BUDGET_MB", 2048), "heap budget across all resident library versions")
+		bundleURL  = fs.String("bundle-url", envOr(getenv, "HEDP_BUNDLE_URL", ""), "template for pulling a revision's bundle, must contain {revision}")
+		maxFlight  = fs.Int("max-in-flight", envOrInt(getenv, "HEDP_MAX_IN_FLIGHT", 2), "concurrent render requests before shedding with 503 (0 disables)")
 		cached     = fs.Bool("cached-engine", envOr(getenv, "HEDP_CACHED_ENGINE", "") == "true", "parse charts once at startup instead of on every render")
 		strict     = fs.Bool("strict", envOr(getenv, "HEDP_STRICT", "") == "true", "treat unresolved template keys as errors")
 		timeout    = fs.Duration("timeout", 10*time.Minute, "per-request timeout")
@@ -60,10 +62,23 @@ func Run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	// Versions live in RAM, keyed by revision, because a release set
 	// corresponds to a commit and a process should be able to serve several at
 	// once without a checkout per version.
-	reg := library.NewRegistry(library.Config{
+	//
+	// The fetcher is what makes more than one replica work: behind a load
+	// balancer a pod cannot be pushed a version, so it pulls the ones it is
+	// asked for.
+	regCfg := library.Config{
 		MemoryBudget:  int64(*budgetMB) << 20,
 		RenderOptions: opts,
-	})
+	}
+	if *bundleURL != "" {
+		fetcher, err := library.NewHTTPFetcher(*bundleURL, 512<<20)
+		if err != nil {
+			return err
+		}
+		regCfg.Fetcher = fetcher
+		logger.Info("bundle source configured", "url_template", *bundleURL)
+	}
+	reg := library.NewRegistry(regCfg)
 
 	// The startup library, if there is one, is loaded from the directory
 	// rather than packed into a bundle first: reading files in parallel is
@@ -86,8 +101,24 @@ func Run(ctx context.Context, args []string, getenv func(string) string, stdout,
 			"load_millis", v.LoadMillis,
 			"compile_millis", v.Renderer.CompileMillis,
 		)
+	} else if *bundleURL != "" && *revision != "" {
+		// Pull the startup revision before serving. Every replica is given the
+		// same -revision, so they all agree on the default; without that, two
+		// pods could answer an unqualified request from different commits.
+		v, err := reg.GetOrFetch(ctx, *revision)
+		if err != nil {
+			return fmt.Errorf("pull startup revision %s: %w", *revision, err)
+		}
+		logger.Info("startup revision pulled",
+			"revision", v.Revision,
+			"bundle_mb", v.BundleBytes>>20,
+			"footprint_mb", v.Footprint>>20,
+			"load_millis", v.LoadMillis,
+		)
+	} else if *bundleURL != "" {
+		logger.Warn("no -revision given; this pod has no default and will only serve requests that pin ?revision=")
 	} else {
-		logger.Info("started with no library; push one to PUT /v1/versions/{revision}")
+		logger.Warn("started with no library and no -bundle-url; every render will 503 until a version is pushed")
 	}
 
 	// Rendering allocates ~67 MB per typical customer, so the Go default of
@@ -102,6 +133,7 @@ func Run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		MaxConfigs:      *maxConfigs,
 		BulkConcurrency: *bulkConc,
 		RequestTimeout:  *timeout,
+		MaxInFlight:     *maxFlight,
 	})
 
 	srv := &http.Server{

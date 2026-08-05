@@ -3,14 +3,19 @@ package server_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sashaakr/research/golang-hedp/internal/catalog"
 	"github.com/sashaakr/research/golang-hedp/internal/library"
@@ -395,5 +400,206 @@ func TestPushRejectsGarbageBundle(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("got %d, want 422: %s", rec.Code, rec.Body)
+	}
+}
+
+// --- running behind a load balancer ------------------------------------------
+
+// stubFetcher stands in for the artifact store a pod pulls bundles from.
+type stubFetcher struct {
+	data    []byte
+	calls   atomic.Int64
+	missing map[string]bool
+	delay   time.Duration
+}
+
+func (f *stubFetcher) Fetch(ctx context.Context, revision string) ([]byte, error) {
+	f.calls.Add(1)
+	if f.delay > 0 {
+		select {
+		case <-time.After(f.delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if f.missing[revision] {
+		return nil, fmt.Errorf("%w: no bundle for %s", library.ErrRevisionNotFound, revision)
+	}
+	return f.data, nil
+}
+
+// TestReplicaPullsUnknownRevision is the behaviour horizontal scaling depends
+// on. A version pushed to one pod is invisible to its siblings, so a pod asked
+// for a revision it does not hold must fetch it rather than 404.
+func TestReplicaPullsUnknownRevision(t *testing.T) {
+	data, err := library.PackFast(libraryRoot(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetcher := &stubFetcher{data: data, missing: map[string]bool{"never-built": true}}
+
+	reg := library.NewRegistry(library.Config{
+		RenderOptions: render.Options{ReleaseConcurrency: 1},
+		Fetcher:       fetcher,
+	})
+	if _, err := reg.LoadDirectory("rev-one", libraryRoot(t)); err != nil {
+		t.Fatal(err)
+	}
+	h := server.NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), reg, server.Config{MaxConfigs: 100})
+
+	// A revision this pod has never seen is pulled and served.
+	req := httptest.NewRequest(http.MethodPost, "/v1/render?revision=pushed-elsewhere",
+		bytes.NewReader([]byte(`{"id":"acme","tier":"free","region":"eu-west-1"}`)))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200: %s", rec.Code, rec.Body)
+	}
+	if fetcher.calls.Load() != 1 {
+		t.Errorf("fetcher called %d times, want 1", fetcher.calls.Load())
+	}
+
+	// It is now resident, so a second request must not re-fetch.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/v1/render?revision=pushed-elsewhere",
+		bytes.NewReader([]byte(`{"id":"acme","tier":"free","region":"eu-west-1"}`)))
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || fetcher.calls.Load() != 1 {
+		t.Errorf("second request re-fetched: code=%d calls=%d", rec.Code, fetcher.calls.Load())
+	}
+
+	// A revision that genuinely does not exist stays a 404 - still never a
+	// silent fallback to the default.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/v1/render?revision=never-built",
+		bytes.NewReader([]byte(`{"id":"acme","tier":"free","region":"eu-west-1"}`)))
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("absent revision got %d, want 404: %s", rec.Code, rec.Body)
+	}
+}
+
+// TestConcurrentMissesFetchOnce guards the thundering herd. Every replica sees
+// the burst for a newly built commit at once; at ~134 MB a copy, fetching it
+// once per in-flight request is how a pod runs out of memory.
+func TestConcurrentMissesFetchOnce(t *testing.T) {
+	data, err := library.PackFast(libraryRoot(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetcher := &stubFetcher{data: data, delay: 50 * time.Millisecond}
+
+	reg := library.NewRegistry(library.Config{
+		RenderOptions: render.Options{ReleaseConcurrency: 1},
+		Fetcher:       fetcher,
+	})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := reg.GetOrFetch(context.Background(), "hot-commit"); err != nil {
+				t.Errorf("fetch failed: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if n := fetcher.calls.Load(); n != 1 {
+		t.Errorf("fetched %d times for one cold revision, want 1", n)
+	}
+	if _, _, count := reg.Usage(); count != 1 {
+		t.Errorf("%d versions resident, want 1", count)
+	}
+}
+
+// TestShedsLoadAtCapacity checks the admission limit. A saturated pod gains no
+// throughput from extra concurrency, so it must refuse and let the load
+// balancer try a replica that can actually help.
+func TestShedsLoadAtCapacity(t *testing.T) {
+	reg := library.NewRegistry(library.Config{
+		RenderOptions: render.Options{ReleaseConcurrency: 1, CachedEngine: true},
+	})
+	if _, err := reg.LoadDirectory("rev-one", libraryRoot(t)); err != nil {
+		t.Fatal(err)
+	}
+	h := server.NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), reg, server.Config{
+		MaxConfigs:  100,
+		MaxInFlight: 1,
+	})
+
+	// Hold the single slot with a render that takes a while.
+	release := make(chan struct{})
+	started := make(chan struct{})
+	go func() {
+		configs := make([]map[string]any, 40)
+		for i := range configs {
+			configs[i] = map[string]any{
+				"id": fmt.Sprintf("hold-%03d", i), "tier": "enterprise",
+				"region": "eu-west-1", "render_all": true,
+			}
+		}
+		body, _ := json.Marshal(map[string]any{"configs": configs, "concurrency": 1})
+		req := httptest.NewRequest(http.MethodPost, "/v1/render/bulk", bytes.NewReader(body))
+		close(started)
+		h.ServeHTTP(httptest.NewRecorder(), req)
+		close(release)
+	}()
+
+	<-started
+	// Give the in-flight counter a moment to register before probing.
+	deadline := time.Now().Add(5 * time.Second)
+	var shed *httptest.ResponseRecorder
+	for time.Now().Before(deadline) {
+		rec := post(t, h, "/v1/render", map[string]any{"id": "probe", "tier": "free", "region": "eu-west-1"})
+		if rec.Code == http.StatusServiceUnavailable {
+			shed = rec
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if shed == nil {
+		t.Fatal("never observed a shed request while the pod was at capacity")
+	}
+	if ra := shed.Header().Get("Retry-After"); ra == "" {
+		t.Error("shed response carries no Retry-After, so a client cannot back off sensibly")
+	}
+
+	// Probes must keep answering at capacity, or Kubernetes pulls a busy pod
+	// out of rotation exactly when it is doing useful work.
+	for _, path := range []string{"/healthz", "/readyz", "/v1/versions"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s returned %d while at capacity, want 200", path, rec.Code)
+		}
+	}
+	<-release
+}
+
+func TestReadyzGatesOnResidentVersion(t *testing.T) {
+	empty := library.NewRegistry(library.Config{})
+	h := server.NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), empty, server.Config{})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("readyz with no version returned %d, want 503", rec.Code)
+	}
+
+	// Liveness must still pass, or Kubernetes restarts a pod that is merely
+	// waiting for its first bundle.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("healthz returned %d with no version, want 200", rec.Code)
+	}
+
+	loaded := newTestServer(t)
+	rec = httptest.NewRecorder()
+	loaded.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("readyz with a version returned %d, want 200", rec.Code)
 	}
 }

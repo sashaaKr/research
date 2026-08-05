@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -29,10 +30,21 @@ func resolveVersion(w http.ResponseWriter, r *http.Request, reg *library.Registr
 		return v, true
 	}
 
-	v, ok := reg.Get(revision)
-	if !ok {
-		encode(w, http.StatusNotFound, errorResponse{
-			Error: fmt.Sprintf("revision %q is not resident; push it to /v1/versions/%s", revision, revision),
+	// Pull it if this replica does not have it. Behind a load balancer that is
+	// the normal case, not an error: a version pushed to one pod was never
+	// seen by the others, so every pod resolves revisions independently.
+	v, err := reg.GetOrFetch(r.Context(), revision)
+	if err != nil {
+		if errors.Is(err, library.ErrRevisionNotFound) {
+			encode(w, http.StatusNotFound, errorResponse{
+				Error: fmt.Sprintf("revision %q is not available: %v", revision, err),
+			})
+			return nil, false
+		}
+		// The artifact store is unreachable. That is our problem, not the
+		// caller's, and it is retryable - so 503, not 404.
+		encode(w, http.StatusServiceUnavailable, errorResponse{
+			Error: fmt.Sprintf("could not load revision %q: %v", revision, err),
 		})
 		return nil, false
 	}
