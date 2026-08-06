@@ -39,10 +39,16 @@ current branch, and that diff has to become API calls against a service whose
 
 5. **Nobody has published the bridge, and the products that solve this
    problem for real don't diff commit-against-commit at all.** decK, Grizzly,
-   Flux and ArgoCD all diff *files at HEAD* against *state fetched live from
-   the API*. See [Prior art](#prior-art-has-somebody-already-built-this) —
-   there is a recommended hybrid there that keeps the Git diff for deciding
-   *which* resources to touch while making the writes idempotent.
+   Flux and ArgoCD all reconcile *files at HEAD* against *state fetched live
+   from the API*. See [Prior art](#prior-art-has-somebody-already-built-this).
+
+6. **Use a three-way merge, not a two-way one.** This is what `kubectl apply`
+   did client-side, and it is the one lesson here that changes the code: diff
+   base commit, head commit **and** the live document together. Two inputs
+   cannot tell "deleted in Git" apart from "added by somebody else", so any
+   two-way form either ignores the server or destroys the fields it owns.
+   Implemented in `ThreeWay`; see
+   [Lessons from Kubernetes](#lessons-from-kubernetes-and-kustomize).
 
 The rest of this README is why, plus a working implementation.
 
@@ -204,9 +210,15 @@ A working, tested implementation of the above. ~700 lines including tests.
 ```
 internal/gitdiff/   Git range → []Change, and (rev, path) → blob content + ID
 internal/docsync/   canonicalisation, patch generation with verification,
-                    change → HTTP request planning
+                    two-way and three-way merge, change → HTTP request planning
 cmd/gitsync/        CLI that prints the plan as JSON, curl commands, or a summary
 ```
+
+Two modes. By default the planner diffs the base commit against the head
+commit, which needs no API access and is correct if the server is guaranteed
+to sit at base. Setting `Planner.Fetch` switches it to a three-way merge
+against the live document, which is what you want in practice — see
+[Lessons from Kubernetes](#lessons-from-kubernetes-and-kustomize).
 
 ```
 go test ./...
@@ -397,19 +409,191 @@ wrong silently.
    preserves the property the Git approach is actually good at — the blast
    radius stays bounded by the merge request, and you never need to enumerate
    every resource the API holds.
-2. For each one, `GET` the current document and diff **that** against the file
-   at `HEAD`. Same `CreateMergePatch` call, same verification; only the
-   left-hand side changes.
+2. For each one, `GET` the current document and reconcile against **that**
+   rather than against the base blob.
 
-That is a small change to `docsync.planUpdate` — swap the base blob for a
-fetched document — and it buys idempotency, self-healing and drift detection.
+> **Correction.** An earlier draft of this section said step 2 should diff
+> live against head — a two-way diff with a fetched left-hand side. That is
+> wrong, and wrong in a data-losing direction: it cannot distinguish "removed
+> in Git" from "added by somebody else", so it deletes every field the server
+> owns. Step 2 needs *three* inputs, not two. See
+> [Lessons from Kubernetes](#2-three-way-merge-not-two-way--and-this-corrects-my-earlier-advice),
+> which is where that mistake surfaced and where the corrected algorithm is
+> implemented.
+
 `X-Base-Version` (trap 4 above) is the cheap approximation for when the API
-has no readable `GET`; if it does have one, prefer the hybrid.
+has no readable `GET`; if it does have one, prefer the three-way merge.
 
 There is a nice parallel in ArgoCD's move to **server-side diff**: rather than
 predicting what the server will store, it does a dry-run apply and compares
 the *result*. Same instinct as the local verification step in `buildPatch` —
 don't reason about what a patch will do, apply it and look.
+
+## Lessons from Kubernetes and kustomize
+
+Kubernetes is the largest deployment of this exact problem — reconcile
+declarative documents in Git against a REST API — and it has been through two
+complete architectural generations. Both generations are instructive, and the
+*transition between them* is the single most useful thing in this document.
+
+### 1. Kubernetes had this architecture and abandoned it
+
+Client-side `kubectl apply` stored the previously-applied document in an
+annotation, `kubectl.kubernetes.io/last-applied-configuration`, and did a
+**three-way merge** against it. That annotation plays exactly the role your
+base commit plays: "what I sent last time."
+
+They moved to Server-Side Apply because the client-held copy of "last applied"
+was the weak link — it could drift from what the server actually had, it was
+subject to size limits, and it could not represent more than one writer. A
+base commit has the first and third problem and not the second.
+
+The transition is worth reading as a warning about the direction of travel,
+but the *client-side* design is the one that maps onto a Git pipeline, and
+its central idea is the thing to steal.
+
+### 2. Three-way merge, not two-way — and this corrects my earlier advice
+
+`kubectl apply` never diffed two versions of a manifest. It diffed three
+documents:
+
+| kubectl | this pipeline |
+|---|---|
+| `last-applied-configuration` annotation | the document at the merge-base commit |
+| the manifest being applied | the document at `HEAD` |
+| the live object | the document fetched from the API |
+
+Three inputs are needed because **two cannot distinguish the two ways a field
+can be missing**:
+
+- present in base, absent from head → *deleted in Git*, must be deleted on the
+  server
+- present in live, absent from base and head → *added by somebody else*, must
+  be left alone
+
+Diffing base against head ignores the server and blindly assumes it sits at
+base. But diffing live against head — the "hybrid" recommended in the Prior
+art section above — is *worse*: it cannot tell those two cases apart, so it
+deletes every field the server owns. Only the three-way form is correct, and
+the hybrid as originally stated would have quietly destroyed server-owned
+fields. `ThreeWay` in `internal/docsync/threeway.go` implements it:
+
+```go
+patch, want, err := docsync.ThreeWay(base, head, live)
+```
+
+It returns the patch *and* the document that applying it should produce —
+which is head plus the fields the server owns, not head alone. Verifying
+against head alone would reject every correct patch the moment the server
+held one extra field.
+
+Set `Planner.Fetch` to switch the planner onto this path. The properties it
+buys, each pinned by a test in `threeway_test.go`:
+
+| scenario | two-way (base→head) | three-way |
+|---|---|---|
+| job re-run after success | patches again | empty patch |
+| job failed halfway | stays inconsistent | repaired next run |
+| field added via the UI | invisible | preserved |
+| field removed in Git | deleted | deleted |
+| server drifted, commits unchanged | invisible forever | corrected |
+
+That last row is the one neither of the earlier designs could reach at all: if
+nothing changed between the two commits, a commit-to-commit diff has nothing
+to say, and the drift persists indefinitely.
+
+### 3. The array problem is solved by *metadata*, not by a better algorithm
+
+Trap 2 above — RFC 7396 replacing arrays wholesale — is the thing Strategic
+Merge Patch exists to fix, and the fix is not a cleverer diff. It is
+**declaring the semantics of each list out of band**:
+
+- In Go API types, struct tags: `patchStrategy:"merge"` and
+  `patchMergeKey:"name"` — merge this list by matching elements on their
+  `name` field rather than replacing it.
+- In CRDs and OpenAPI: `x-kubernetes-list-type: map|set|atomic` with
+  `x-kubernetes-list-map-keys`, and `x-kubernetes-map-type:
+  granular|atomic`.
+
+The general lesson is that **list merge semantics are not recoverable from the
+data** — `["a","b"]` could be an ordered sequence, an unordered set, or a
+keyed collection, and only a human knows which. Every system that gets this
+right takes the answer as configuration. `jd`'s `PathOptions` (`SET`,
+`MULTISET`, `setkeys`) are the same idea in a much smaller package, and are
+the practical route here if your arrays are really keyed collections.
+
+### 4. When one sentinel isn't enough, add vocabulary
+
+Strategic Merge Patch also shows what to do about the `null` ambiguity if
+your API surface is still negotiable. Rather than overloading one value, it
+adds explicit directives: `$patch: delete`, `$patch: replace`,
+`$setElementOrder/<list>`, `$deleteFromPrimitiveList/<list>`, `$retainKeys`.
+
+The design principle is that **intent should be stated, not inferred**.
+RFC 7396 infers deletion from a value that is also legal data, and that single
+decision is the origin of the entire fallback machinery in this project. If
+you are defining the API rather than consuming it, one explicit directive
+removes the need for all of it.
+
+### 5. "Apply" is a different verb from PUT and PATCH
+
+The clearest statement of the idea, from `structured-merge-diff`'s docs:
+
+> PUT/PATCH says: "Make the object look EXACTLY like X". APPLY says: "The
+> fields I manage should now look exactly like this (but I don't care about
+> other fields)."
+
+Server-Side Apply tracks per-field ownership in `metadata.managedFields`, so
+two writers touching disjoint fields never conflict, and two writers touching
+the *same* field get an explicit error instead of last-write-wins.
+
+For this pipeline that translates to a question worth answering before
+writing any more code: **is Git the sole owner of these documents, or one
+writer among several?** If sole, the three-way merge is sufficient. If not,
+the honest design is to declare which fields Git owns and have the server
+reject writes to fields owned by others — and at that point you are
+reimplementing SSA, which is a good reason to look at whether the API can
+adopt it wholesale.
+
+### 6. Reusable Go code, if you want to go further
+
+- **`sigs.k8s.io/kustomize/kyaml/yaml/merge3`** — a three-way merge over
+  arbitrary YAML/JSON nodes, with associative-key list merging and the SMP
+  directives, and it preserves comments because it works on YAML nodes rather
+  than on decoded values. Not Kubernetes-specific in its core.
+  `merge2` is the two-way form.
+- **`sigs.k8s.io/structured-merge-diff`** — the engine behind SSA:
+  schema-typed values, field sets, and ownership tracking.
+
+Both are heavier dependencies than `evanphx/json-patch`, and both assume you
+can describe your documents with a schema. Worth adopting if the array
+semantics or the multi-writer problem turn out to be real for you; not worth
+it just to compute a merge patch.
+
+### On `antchfx/xpath` — a different axis
+
+[`antchfx/xpath`](https://github.com/antchfx/xpath) is an XPath engine whose
+`NodeNavigator` interface lets one query engine drive XML, HTML and JSON
+(via `jsonquery`) from a single implementation. It is a **selection** library,
+not a diff or patch library, so it does not compete with anything above.
+
+It is still worth the detour, because it names the alternative to diffing
+entirely. Kustomize's transformers work this way: a `FieldSpec` names a path,
+a transformer rewrites whatever is there, and no diff is ever computed. If
+part of your sync is rule-shaped — *"always set `region` to the CI variable"*,
+*"strip every `debug` flag"* — that is a path-addressed transform, and
+expressing it as a document diff is the wrong shape. Diffing answers "mirror
+whatever the file says"; addressing answers "enforce this invariant." Real
+pipelines usually want both.
+
+One design detail worth copying from the patch RFCs, though: they deliberately
+address nodes with **JSON Pointer** (RFC 6901), not with a query language.
+Pointer resolves to exactly one location or fails. XPath and JSONPath
+(standardised as RFC 9535 in 2024) can match zero, one or many nodes depending
+on the document — which is exactly what you want for a query and exactly what
+you do not want for a patch, where "apply this to whatever matched" is
+non-deterministic against a document you have not seen. Use the query language
+to *find* things; use Pointer-shaped addressing to *change* them.
 
 ## When to use something other than merge patch
 
@@ -441,3 +625,9 @@ real operational advantage, and it wins.
 - [sourcegraph/go-diff](https://github.com/sourcegraph/go-diff) and [bluekeyes/go-gitdiff](https://github.com/bluekeyes/go-gitdiff) — unified diff parsers, i.e. the approach this project argues against
 - [Kong decK](https://github.com/Kong/deck) and [its GitOps workflow](https://konghq.com/blog/engineering/gitops-for-kong-managing-kong-declaratively-with-deck-and-github-actions) — the closest existing product to this pipeline
 - [Argo CD diff strategies](https://argo-cd.readthedocs.io/en/stable/user-guide/diff-strategies/) — desired-vs-actual reconciliation and server-side diff
+- [Kubernetes strategic merge patch](https://github.com/kubernetes/community/blob/main/contributors/devel/sig-api-machinery/strategic-merge-patch.md) — merge keys and the `$patch` directives
+- [Server-Side Apply](https://kubernetes.io/docs/reference/using-api/server-side-apply/) and [KEP-555](https://github.com/kubernetes/enhancements/blob/master/keps/sig-api-machinery/555-server-side-apply/README.md) — field ownership, and why the last-applied annotation was retired
+- [kustomize `kyaml/yaml/merge3`](https://pkg.go.dev/sigs.k8s.io/kustomize/kyaml/yaml/merge3) and [`merge2`](https://pkg.go.dev/sigs.k8s.io/kustomize/kyaml/yaml/merge2) — reusable three-way and two-way merges over YAML nodes
+- [structured-merge-diff](https://github.com/kubernetes-sigs/structured-merge-diff) — the schema-aware engine behind Server-Side Apply
+- [antchfx/xpath](https://github.com/antchfx/xpath) — XPath over XML/HTML/JSON; the addressing axis rather than the diffing one
+- [RFC 9535 — JSONPath](https://www.rfc-editor.org/rfc/rfc9535) — the standardised JSON query language, as distinct from JSON Pointer

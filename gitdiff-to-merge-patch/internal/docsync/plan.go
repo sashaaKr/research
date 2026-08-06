@@ -101,7 +101,26 @@ type Planner struct {
 	// IncludeBaseVersion attaches X-Base-Version to update and delete
 	// requests.
 	IncludeBaseVersion bool
+
+	// Fetch returns the document the API currently holds for a resource, or
+	// ErrResourceAbsent if there is none.
+	//
+	// When set, updates are planned as a three-way merge (base commit, head
+	// commit, live document) instead of a two-way diff between commits. This
+	// is what `kubectl apply` does and what every mature Git-to-API sync tool
+	// does, and it is the difference between a blind write and a convergent
+	// one: reruns become idempotent, a half-applied job is repaired by the
+	// next run, and fields the server owns are left alone instead of being
+	// clobbered. See ThreeWay and the README.
+	//
+	// Leaving it nil keeps the two-way behaviour, which is correct only if
+	// the server is guaranteed to sit exactly at base.
+	Fetch func(ctx context.Context, url string) ([]byte, error)
 }
+
+// ErrResourceAbsent reports that the API holds no document for a resource.
+// Fetch returns it to signal that an update should be planned as a create.
+var ErrResourceAbsent = errors.New("docsync: resource absent")
 
 // Plan builds the request list for a revision range.
 //
@@ -245,16 +264,49 @@ func (p Planner) planUpdate(ctx context.Context, repo gitdiff.Repo, base, head s
 		return nil, err
 	}
 
-	// Git says the bytes changed; canonical JSON says the meaning did not.
-	// Reformatting, key reordering and YAML comment edits all land here and
-	// are dropped rather than sent.
-	if jsonpatch.Equal(original, target) {
+	// In two-way mode, Git says the bytes changed but canonical JSON says the
+	// meaning did not. Reformatting, key reordering and YAML comment edits all
+	// land here and are dropped rather than sent. In three-way mode this check
+	// is not safe -- the server may have drifted even when the commits agree --
+	// so it moves inside planThreeWay, against the live document.
+	if p.Fetch == nil && jsonpatch.Equal(original, target) {
 		return nil, nil
 	}
 
-	body, strategy, reason, err := p.buildPatch(original, target)
-	if err != nil {
-		return nil, err
+	var (
+		body     []byte
+		strategy Strategy
+		reason   string
+	)
+	if p.Fetch != nil {
+		live, ferr := p.Fetch(ctx, url)
+		if errors.Is(ferr, ErrResourceAbsent) {
+			// The repository says this resource changed, but the server does
+			// not have it at all -- a previous sync never landed. Create it.
+			req, cerr := p.planCreate(ctx, repo, head, ch)
+			if cerr != nil {
+				return nil, cerr
+			}
+			for i := range req {
+				req[i].Reason = "resource absent on the server; creating it"
+			}
+			return req, nil
+		}
+		if ferr != nil {
+			return nil, fmt.Errorf("fetching %s: %w", url, ferr)
+		}
+		body, strategy, reason, err = p.planThreeWay(original, target, live)
+		if err != nil {
+			return nil, err
+		}
+		if strategy == "" { // server already agrees with the repository
+			return nil, nil
+		}
+	} else {
+		body, strategy, reason, err = p.buildPatch(original, target)
+		if err != nil {
+			return nil, err
+		}
 	}
 	headers := map[string]string{"Content-Type": mediaTypeFor(strategy)}
 	if p.IncludeBaseVersion {
@@ -274,6 +326,61 @@ func (p Planner) planUpdate(ctx context.Context, repo gitdiff.Repo, base, head s
 		Reason:   reason,
 		Change:   ch,
 	}}, nil
+}
+
+// planThreeWay reconciles the repository against what the server actually
+// holds. An empty strategy means there is nothing to send.
+//
+// The verification target here is not the head document: it is head merged
+// with the fields the server owns, which is what ThreeWay returns alongside
+// the patch. Verifying against head alone would reject every correct patch
+// the moment the server held one extra field.
+func (p Planner) planThreeWay(original, target, live []byte) (body []byte, strategy Strategy, reason string, err error) {
+	canonicalLive, err := canonicalJSON(live)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("canonicalising the live document: %w", err)
+	}
+
+	patch, want, err := ThreeWay(original, target, canonicalLive)
+	if err != nil {
+		return nil, "", "", err
+	}
+
+	// An empty patch means the server is already where the repository wants
+	// it. This subsumes the two-way no-op check and is strictly stronger: it
+	// also catches the case where a previous run already applied this change.
+	if jsonpatch.Equal(patch, []byte(`{}`)) {
+		return nil, "", "", nil
+	}
+
+	if ok, verifyErr := mergePatchIsFaithful(canonicalLive, patch, want); ok {
+		return patch, StrategyMergePatch, "", nil
+	} else {
+		reason = explainMergeFailure(want, verifyErr)
+	}
+
+	switch p.fallback() {
+	case FallbackReplace:
+		// Send the merged document, not the head document. Replacing with
+		// head would delete the fields the server owns -- the exact mistake
+		// the three-way merge exists to avoid.
+		return want, StrategyReplace, reason, nil
+	case FallbackJSONPatch:
+		ops, err := jsondiff.CompareJSON(canonicalLive, want)
+		if err != nil {
+			return nil, "", "", fmt.Errorf("%s; json patch fallback failed: %w", reason, err)
+		}
+		encoded, err := json.Marshal(ops)
+		if err != nil {
+			return nil, "", "", fmt.Errorf("%s; encoding json patch failed: %w", reason, err)
+		}
+		if ok, err := jsonPatchIsFaithful(canonicalLive, encoded, want); !ok {
+			return nil, "", "", fmt.Errorf("%s; json patch fallback also failed verification: %v", reason, err)
+		}
+		return encoded, StrategyJSONPatch, reason, nil
+	default:
+		return nil, "", "", errors.New(reason)
+	}
 }
 
 // buildPatch produces the smallest faithful body for original -> target.
