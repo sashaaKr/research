@@ -37,6 +37,13 @@ current branch, and that diff has to become API calls against a service whose
    "the API silently holds different data than Git" into "this one file was
    sent as a replacement instead", which is a non-event.
 
+5. **Nobody has published the bridge, and the products that solve this
+   problem for real don't diff commit-against-commit at all.** decK, Grizzly,
+   Flux and ArgoCD all diff *files at HEAD* against *state fetched live from
+   the API*. See [Prior art](#prior-art-has-somebody-already-built-this) —
+   there is a recommended hybrid there that keeps the Git diff for deciding
+   *which* resources to touch while making the writes idempotent.
+
 The rest of this README is why, plus a working implementation.
 
 ## The core decision: don't parse the diff
@@ -286,6 +293,124 @@ on the protected branch after merge. The plan is a plain JSON document
 (`-format json`), so the apply step is a loop over requests, not a re-run of
 the diff logic.
 
+## Prior art: has somebody already built this?
+
+Short answer: **the two halves are solved, the bridge is not, and the products
+that solve the whole problem deliberately solve a different one.**
+
+### Nothing does "git diff → JSON Patch" end to end
+
+There is no library, in Go or elsewhere, that takes a Git range and emits
+patch documents. Searching for one turns up two disjoint populations:
+
+- **JSON-document differs** — `evanphx/json-patch`, `wI2L/jsondiff`, `jd`,
+  `jsondiffpatch` (JS), `jsondiffpatch.net` (C#), `jiff` (JS), and a pile of
+  browser-based generators. All take *two JSON documents*. None knows about
+  Git.
+- **Unified-diff parsers** — [`sourcegraph/go-diff`](https://github.com/sourcegraph/go-diff),
+  [`bluekeyes/go-gitdiff`](https://github.com/bluekeyes/go-gitdiff),
+  `waigani/diffparser`, `codepawfect/git-diff-parser`. All take *diff text*
+  and return hunks, line ranges and file modes. They exist for code review
+  tooling, lint-on-changed-lines and patch application. None reconstructs
+  JSON structure, because — as above — it isn't recoverable from hunks.
+
+So the intuition that "somebody was supposed to do that" is half-right:
+people did build Git diff parsers, just not for this. The bridge doesn't
+exist as a package because, once you stop trying to parse diff text, it's
+about fifty lines of glue — which is most of `internal/docsync` here.
+
+### The closest existing thing: `jd` as a Git diff driver
+
+[`jd`](https://github.com/josephburnett/jd) is the one tool that spans both
+worlds. It registers as a Git diff driver:
+
+```bash
+git config diff.jd.command 'jd --git-diff-driver'
+echo "*.json diff=jd" >> .gitattributes
+```
+
+after which `git diff` on JSON files shows structural diffs instead of line
+noise. That's worth doing regardless of this project — it makes config
+changes readable on a merge request.
+
+It also has the output format you need (`-f merge` for RFC 7386/7396,
+`-f patch` for RFC 6902) and format translation (`-t patch2merge`). Which
+means there is a **zero-code version of this entire pipeline**, worth knowing
+before writing Go:
+
+```bash
+git diff --name-only "$BASE...$HEAD" -- config/ | while read -r f; do
+  jd -f merge \
+     <(git show "$BASE:$f") \
+     <(git show "$HEAD:$f")
+done
+```
+
+`jd` reads YAML natively too, so this covers the YAML case for free.
+
+The caveats are real but bounded: the diff-driver path emits the
+human-readable `jd` format rather than merge patch (the driver protocol hands
+you temp file paths, so for a pipeline you'd invoke `jd` directly as above
+rather than route through Git's diff machinery), and it has no verification
+step, so the `null` trap is fully live. You can close that in shell —
+apply the patch back with `jd -p` and compare — at which point you have
+reimplemented this repo in Bash. **If your documents provably never contain
+`null`, the shell version is the honest recommendation and you should not
+write Go for this.** The Go implementation earns its place when you want the
+verification, the no-op filtering, and the plan-then-apply split.
+
+### The products that solve the whole problem chose a different architecture
+
+This is the finding worth acting on. Git-to-API sync is a well-trodden
+problem — [Kong's decK](https://github.com/Kong/deck), Grafana's Grizzly,
+[Flux and ArgoCD](https://argo-cd.readthedocs.io/en/stable/user-guide/diff-strategies/)
+all do exactly it, and decK is Go and has a documented GitHub Actions
+workflow of "`deck diff` on the PR, `deck sync` on merge" that is precisely
+the pipeline shape described here.
+
+**None of them diffs commit against commit.** Every one of them diffs
+*desired state* (the files at `HEAD`) against *actual state* (fetched live
+from the API). The Git history is used to decide *when* to reconcile, never
+*what* to send.
+
+That distinction is not stylistic, and it maps directly onto the safety
+requirement:
+
+| | commit-to-commit (what the task implies) | desired-vs-actual (what the products do) |
+|---|---|---|
+| Assumes server is at `base` | yes, blindly | no |
+| Job retried, or run out of order | applies twice / applies to wrong base | converges, idempotent |
+| Job failed halfway through | permanently inconsistent | fixed by the next run |
+| Somebody edited via the UI | drift is invisible and permanent | detected as drift |
+| Needs read access to the API | no | yes, a `GET` per resource |
+| Blast radius | bounded by the merge request | whatever the reconciler sees |
+
+A commit-to-commit patch is a *blind write*: it is only correct if the server
+is in exactly the state the base commit describes, and nothing in the design
+checks that. Everything that can desynchronise a pipeline — a skipped job, a
+retry, two merge requests merging minutes apart, a manual fix — makes it
+wrong silently.
+
+**Recommended hybrid.** Keep the Git diff, but demote what it's used for:
+
+1. Use `git diff --name-status` to decide **which resources to touch**. This
+   preserves the property the Git approach is actually good at — the blast
+   radius stays bounded by the merge request, and you never need to enumerate
+   every resource the API holds.
+2. For each one, `GET` the current document and diff **that** against the file
+   at `HEAD`. Same `CreateMergePatch` call, same verification; only the
+   left-hand side changes.
+
+That is a small change to `docsync.planUpdate` — swap the base blob for a
+fetched document — and it buys idempotency, self-healing and drift detection.
+`X-Base-Version` (trap 4 above) is the cheap approximation for when the API
+has no readable `GET`; if it does have one, prefer the hybrid.
+
+There is a nice parallel in ArgoCD's move to **server-side diff**: rather than
+predicting what the server will store, it does a dry-run apply and compares
+the *result*. Same instinct as the local verification step in `buildPatch` —
+don't reason about what a patch will do, apply it and look.
+
 ## When to use something other than merge patch
 
 Merge patch is the right default *because the API already speaks it* — the
@@ -313,3 +438,6 @@ real operational advantage, and it wins.
 - [evanphx/json-patch](https://github.com/evanphx/json-patch) — [pkg.go.dev](https://pkg.go.dev/github.com/evanphx/json-patch/v5)
 - [wI2L/jsondiff](https://github.com/wI2L/jsondiff) — [pkg.go.dev](https://pkg.go.dev/github.com/wI2L/jsondiff)
 - [josephburnett/jd](https://github.com/josephburnett/jd) — [pkg.go.dev](https://pkg.go.dev/github.com/josephburnett/jd)
+- [sourcegraph/go-diff](https://github.com/sourcegraph/go-diff) and [bluekeyes/go-gitdiff](https://github.com/bluekeyes/go-gitdiff) — unified diff parsers, i.e. the approach this project argues against
+- [Kong decK](https://github.com/Kong/deck) and [its GitOps workflow](https://konghq.com/blog/engineering/gitops-for-kong-managing-kong-declaratively-with-deck-and-github-actions) — the closest existing product to this pipeline
+- [Argo CD diff strategies](https://argo-cd.readthedocs.io/en/stable/user-guide/diff-strategies/) — desired-vs-actual reconciliation and server-side diff
