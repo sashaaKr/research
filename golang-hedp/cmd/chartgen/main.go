@@ -16,6 +16,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -37,6 +38,7 @@ type options struct {
 	templateFrac float64
 	crdFrac      float64
 	seed         int64
+	dialect      string
 }
 
 func run() error {
@@ -47,6 +49,7 @@ func run() error {
 	flag.Float64Var(&o.templateFrac, "template-frac", 0.35, "fraction of bytes that live in templates/ (parsed by the engine)")
 	flag.Float64Var(&o.crdFrac, "crd-frac", 0.40, "fraction of bytes that live in crds/ (never parsed, never read)")
 	flag.Int64Var(&o.seed, "seed", 1, "PRNG seed, so output is reproducible")
+	flag.StringVar(&o.dialect, "dialect", "helm", "template dialect: helm (Go text/template) or jinja (for the Rust port)")
 	flag.Parse()
 
 	if o.charts < 1 {
@@ -54,6 +57,9 @@ func run() error {
 	}
 	if o.templateFrac+o.crdFrac > 1 {
 		return fmt.Errorf("-template-frac + -crd-frac must be <= 1 (remainder goes to files/)")
+	}
+	if o.dialect != "helm" && o.dialect != "jinja" {
+		return fmt.Errorf("-dialect must be helm or jinja, got %q", o.dialect)
 	}
 
 	if err := os.RemoveAll(o.outDir); err != nil {
@@ -69,7 +75,7 @@ func run() error {
 
 	var stats libraryStats
 	for _, spec := range specs {
-		s, err := writeChart(filepath.Join(chartsDir, spec.Name), spec, rng)
+		s, err := writeChart(filepath.Join(chartsDir, spec.Name), spec, rng, o.dialect)
 		if err != nil {
 			return fmt.Errorf("chart %s: %w", spec.Name, err)
 		}
@@ -81,7 +87,7 @@ func run() error {
 		return err
 	}
 
-	fmt.Printf("wrote %d charts to %s\n", len(specs), chartsDir)
+	fmt.Printf("wrote %d %s charts to %s\n", len(specs), o.dialect, chartsDir)
 	fmt.Printf("  templates/ %6.1f MB in %4d files  (parsed + executed every render)\n", mb(stats.templateBytes), stats.templateFiles)
 	fmt.Printf("  files/     %6.1f MB in %4d files  (read via .Files, not parsed)\n", mb(stats.fileBytes), stats.fileFiles)
 	fmt.Printf("  crds/      %6.1f MB in %4d files  (never touched by the engine)\n", mb(stats.crdBytes), stats.crdFiles)
@@ -160,7 +166,7 @@ func planCharts(o options, rng *rand.Rand) []chartSpec {
 	return specs
 }
 
-func writeChart(dir string, spec chartSpec, rng *rand.Rand) (libraryStats, error) {
+func writeChart(dir string, spec chartSpec, rng *rand.Rand, dialect string) (libraryStats, error) {
 	var stats libraryStats
 
 	write := func(rel string, content string, bucket *int64, count *int) error {
@@ -202,6 +208,9 @@ func writeChart(dir string, spec chartSpec, rng *rand.Rand) (libraryStats, error
 		"templates/assets.yaml":     assetsTpl,
 		"templates/NOTES.txt":       notesTpl,
 	}
+	if dialect == "jinja" {
+		fixed = jinjaFixed()
+	}
 	names := make([]string, 0, len(fixed))
 	for n := range fixed {
 		names = append(names, n)
@@ -216,14 +225,18 @@ func writeChart(dir string, spec chartSpec, rng *rand.Rand) (libraryStats, error
 	// Bulk templates: dashboard ConfigMaps with a large embedded payload and
 	// enough template actions that the engine cannot shortcut them. This is
 	// the realistic shape of a multi-MB chart's templates/ directory.
-	remaining := spec.templateBytes - stats.templateBytes
-	for i := 0; remaining > 0; i++ {
-		size := min64(remaining, 96<<10)
-		body := dashboardTemplate(spec.Name, i, size, rng)
-		if err := write(fmt.Sprintf("templates/dashboards/dashboard-%03d.yaml", i), body, &stats.templateBytes, &stats.templateFiles); err != nil {
+	// Both dialects generate the same dashboards with the same panels, decided
+	// once so the two libraries stay the same workload.
+	for _, plan := range planDashboards(spec.Name, spec.templateBytes-helmFixedBytes()) {
+		body := dashboardWithPanels(spec.Name, plan.index, plan.panels)
+		name := fmt.Sprintf("templates/dashboards/dashboard-%03d.yaml", plan.index)
+		if dialect == "jinja" {
+			body = jinjaDashboardWithPanels(spec.Name, plan.index, plan.panels)
+			name = fmt.Sprintf("templates/dashboards/dashboard-%03d.j2", plan.index)
+		}
+		if err := write(name, body, &stats.templateBytes, &stats.templateFiles); err != nil {
 			return stats, err
 		}
-		remaining -= int64(len(body))
 	}
 
 	// files/: shipped with the chart, reachable through .Files.Glob, never
@@ -574,12 +587,76 @@ data:
 const notesTpl = `{{ include "chart.fullname" . }} deployed for customer {{ .Values.customer.id }} in {{ .Values.customer.region }}.
 `
 
-// dashboardTemplate produces a large ConfigMap template. The embedded payload
-// is padded to `size`, and template actions are sprinkled through it so the
-// engine has to walk the whole thing rather than treating it as one text node.
-func dashboardTemplate(chartName string, idx int, size int64, rng *rand.Rand) string {
+// dashPlan fixes how many dashboards a chart gets and how many panels each
+// one carries.
+//
+// It is computed once, from the Helm dialect's sizes, and both dialects then
+// generate exactly that. Sizing each dialect independently by byte budget
+// would give them different template counts and different panel counts - the
+// Jinja syntax is not the same length - and the two libraries would stop being
+// the same workload.
+type dashPlan struct {
+	index  int
+	panels int
+}
+
+// helmFixedBytes is the Helm dialect's fixed-template total. Planning always
+// subtracts this, whichever dialect is being written, so both get the same
+// dashboards - the Jinja fixed templates are a slightly different size and
+// budgeting per dialect would silently desynchronise the two libraries.
+func helmFixedBytes() int64 {
+	var n int64
+	for _, body := range []string{
+		helpersTpl, deploymentTpl, serviceTpl, configmapTpl,
+		ingressTpl, hpaTpl, rbacTpl, assetsTpl, notesTpl,
+	} {
+		n += int64(len(body))
+	}
+	return n
+}
+
+func planDashboards(chartName string, budget int64) []dashPlan {
+	var plans []dashPlan
+	remaining := budget
+	for i := 0; remaining > 0; i++ {
+		size := min64(remaining, 96<<10)
+		// Measure the Helm dialect to decide the panel count, so both dialects
+		// agree on it.
+		body := dashboardTemplate(chartName, i, size, 0)
+		plans = append(plans, dashPlan{index: i, panels: countPanels(chartName, i, size)})
+		remaining -= int64(len(body))
+	}
+	return plans
+}
+
+func countPanels(chartName string, idx int, size int64) int {
 	var b strings.Builder
-	fmt.Fprintf(&b, `apiVersion: v1
+	writeDashboardHeader(&b, chartName, idx)
+	panel := 0
+	for int64(b.Len()) < size {
+		writeDashboardPanel(&b, chartName, idx, panel)
+		panel++
+	}
+	return panel
+}
+
+// dashToken derives a per-panel identifier from the chart, dashboard and panel
+// index instead of from a shared PRNG. A shared PRNG would be consumed in a
+// different order by each dialect and the static text would diverge.
+func dashToken(chartName string, idx, panel int) string {
+	h := fnv.New64a()
+	fmt.Fprintf(h, "%s/%d/%d", chartName, idx, panel)
+	sum := h.Sum64()
+	b := make([]byte, 24)
+	for i := range b {
+		b[i] = alphabet[sum%uint64(len(alphabet))]
+		sum = sum*6364136223846793005 + 1442695040888963407
+	}
+	return string(b)
+}
+
+func writeDashboardHeader(b *strings.Builder, chartName string, idx int) {
+	fmt.Fprintf(b, `apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ include "chart.fullname" . }}-dash-%03d
@@ -594,10 +671,10 @@ data:
       "tags": [{{ range $i, $f := .Values.customer.features }}{{ if $i }}, {{ end }}{{ $f | quote }}{{ end }}],
       "panels": [
 `, idx, chartName, idx, chartName, idx)
+}
 
-	panel := 0
-	for int64(b.Len()) < size {
-		fmt.Fprintf(&b, `        {
+func writeDashboardPanel(b *strings.Builder, chartName string, idx, panel int) {
+	fmt.Fprintf(b, `        {
           "id": %d,
           "type": %q,
           "title": "{{ .Values.customer.tier }} panel %d",
@@ -606,15 +683,42 @@ data:
           "fieldConfig": {"defaults": {"unit": "reqps", "custom": {"lineWidth": %d, "fillOpacity": %d}}},
           "gridPos": {"h": 8, "w": 12, "x": %d, "y": %d}
         },
-`, panel, panelTypes[panel%len(panelTypes)], panel, chartName, randToken(rng, 24), 1+panel%3, panel%40, (panel%2)*12, (panel/2)*8)
+`, panel, panelTypes[panel%len(panelTypes)], panel, chartName, dashToken(chartName, idx, panel),
+		1+panel%3, panel%40, (panel%2)*12, (panel/2)*8)
+}
+
+// dashboardTemplate produces a large ConfigMap template. The embedded payload
+// is padded to `size`, and template actions are sprinkled through it so the
+// engine has to walk the whole thing rather than treating it as one text node.
+func dashboardTemplate(chartName string, idx int, size int64, _ int) string {
+	var b strings.Builder
+	writeDashboardHeader(&b, chartName, idx)
+	panel := 0
+	for int64(b.Len()) < size {
+		writeDashboardPanel(&b, chartName, idx, panel)
 		panel++
 	}
+	closeDashboard(&b)
+	return b.String()
+}
 
+// dashboardWithPanels renders exactly n panels, for when the count has already
+// been decided by planDashboards.
+func dashboardWithPanels(chartName string, idx, panels int) string {
+	var b strings.Builder
+	writeDashboardHeader(&b, chartName, idx)
+	for panel := 0; panel < panels; panel++ {
+		writeDashboardPanel(&b, chartName, idx, panel)
+	}
+	closeDashboard(&b)
+	return b.String()
+}
+
+func closeDashboard(b *strings.Builder) {
 	b.WriteString(`        {"id": 9999, "type": "row", "title": "end"}
       ]
     }
 `)
-	return b.String()
 }
 
 var panelTypes = []string{"timeseries", "stat", "gauge", "table", "heatmap", "barchart"}

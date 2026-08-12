@@ -366,6 +366,15 @@ behind a Service reaches exactly one replica.
 Full write-up, including probes, HPA, GOGC and a reference manifest:
 **[DEPLOYMENT.md](DEPLOYMENT.md)**.
 
+## Would this be faster in Rust?
+
+Measured, with byte-identical output verified: **yes, ~2.2x faster and 15x
+smaller in memory - and probably not worth doing.** The Rust port cannot render
+Helm charts at all, because Helm charts are Go `text/template` plus sprig and
+no Rust library implements that. See **[../rust-hedp](../rust-hedp)** for the
+full comparison, including the four bugs that had to be fixed before the two
+services rendered the same bytes.
+
 ## Design notes
 
 **Charts are loaded once per revision and shared by every goroutine.** Helm deep-copies

@@ -4,6 +4,10 @@
 gen bytes="57671680" charts="40":
     go run ./cmd/chartgen -out testdata/library -bytes {{bytes}} -charts {{charts}}
 
+# Generate the Jinja dialect of the same library, for the Rust comparison.
+gen-jinja:
+    go run ./cmd/chartgen -out testdata/library-jinja -dialect jinja
+
 # Generate a library with a different template/CRD split, to see how the byte
 # mix moves the numbers.
 gen-split template_frac crd_frac:
