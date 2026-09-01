@@ -1,0 +1,93 @@
+# golang-hedp - dynamic Helm release rendering service
+
+# Generate the synthetic 55 MB chart library (gitignored build artifact).
+gen bytes="57671680" charts="40":
+    go run ./cmd/chartgen -out testdata/library -bytes {{bytes}} -charts {{charts}}
+
+# Generate the Jinja dialect of the same library, for the Rust comparison.
+gen-jinja:
+    go run ./cmd/chartgen -out testdata/library-jinja -dialect jinja
+
+# Generate a library with a different template/CRD split, to see how the byte
+# mix moves the numbers.
+gen-split template_frac crd_frac:
+    go run ./cmd/chartgen -out testdata/library -template-frac {{template_frac}} -crd-frac {{crd_frac}}
+
+build:
+    go build -o bin/hedp ./cmd/hedp
+    go build -o bin/loadgen ./cmd/loadgen
+
+test:
+    go test ./...
+
+# The differential test against Helm's own engine, plus the race detector on
+# the shared-chart paths. Run this before trusting -cached-engine.
+verify:
+    go test ./internal/render/cachedengine/ -run TestMatchesHelmEngine -v
+    go test ./internal/render/... -race -run 'Concurrent|CachedEngineMatchesHelm'
+
+# Serve with the stock Helm engine.
+serve: build
+    ./bin/hedp -addr 127.0.0.1:8080 -library testdata/library
+
+# Serve with charts parsed once at startup, tuned for bulk throughput.
+serve-fast: build
+    GOGC=400 ./bin/hedp -addr 127.0.0.1:8080 -library testdata/library -cached-engine
+
+# Tuned for single-request latency instead: releases within one customer render
+# in parallel. Costs throughput under bulk load.
+serve-lowlatency: build
+    GOGC=400 ./bin/hedp -addr 127.0.0.1:8080 -library testdata/library -cached-engine -release-concurrency 4
+
+# What GC tuning is worth on this workload.
+bench-gc:
+    for g in 100 400 800; do echo "GOGC=$g"; \
+        GOGC=$g go test ./internal/render/ -run '^$' -bench 'BenchmarkBulkEngine/cached' -benchtime 3x -timeout 30m | grep BulkEngine; \
+    done
+
+bench:
+    go test ./internal/render/ -run '^$' -bench . -benchtime 5x -timeout 60m
+
+# Just the numbers that decide the architecture.
+bench-core:
+    go test ./internal/render/ -run '^$' -bench 'BenchmarkStage|BenchmarkEngine$|BenchmarkPlan' -benchtime 10x -timeout 30m
+    go test ./internal/render/cachedengine/ -run '^$' -bench . -benchtime 20x
+
+# Drive the running service. Start `just serve-fast` in another shell first.
+load configs="200":
+    ./bin/loadgen -configs {{configs}}
+
+# Push a library directory as a versioned revision, no checkout on the server.
+push revision dir="testdata/library": build
+    ./bin/loadgen -revision {{revision}} -push {{dir}}
+
+# How chunk size and client concurrency behave against one pod - the two
+# measurements that decide the Kubernetes topology. Needs a running service.
+bench-topology:
+    @echo "chunk size sweep (1000 configs, 1 client):"
+    @for c in 10 25 50 100 250 1000; do \
+        printf "  chunk=%-5s " $c; \
+        ./bin/loadgen -configs 1000 -chunk $c | grep -E 'throughput|chunk wall p50' | tr -s ' ' | tr '\n' ' '; echo; \
+    done
+    @echo "client concurrency sweep (1000 configs, chunk=100):"
+    @for n in 1 2 4 8; do \
+        printf "  clients=%-3s " $n; \
+        ./bin/loadgen -configs 1000 -chunk 100 -clients $n | grep -E 'throughput|per-config p50' | tr -s ' ' | tr '\n' ' '; echo; \
+    done
+
+# What revisions are resident and what they cost.
+versions:
+    curl -s localhost:8080/v1/versions | python3 -m json.tool
+
+# How a version becomes servable: directory vs bundle vs packed bundle,
+# and what a resident version costs in heap.
+bench-versions:
+    go test ./internal/library/ -run '^$' -bench . -benchtime 10x -timeout 30m
+
+profile:
+    go test ./internal/render/ -run '^$' -bench 'BenchmarkEngine/helm/all' -benchtime 20x \
+        -cpuprofile cpu.prof -memprofile mem.prof -timeout 30m
+    go tool pprof -top -nodecount=25 cpu.prof
+
+clean:
+    rm -rf bin testdata *.prof *.test

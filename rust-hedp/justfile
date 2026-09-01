@@ -1,0 +1,32 @@
+# rust-hedp - Rust port of golang-hedp, for benchmarking against it
+
+# Generate the Jinja chart library (from the Go project's chartgen).
+gen:
+    cd ../golang-hedp && go run ./cmd/chartgen -out testdata/library-jinja -dialect jinja
+
+build:
+    cargo build --release
+
+# Prove both services render identical bytes. Run this before trusting any
+# benchmark number - without it the comparison is meaningless.
+verify: build
+    ./verify-equivalence.sh
+
+bench: build
+    ./target/release/bench --iterations 8
+
+serve: build
+    ./target/release/hedp --addr 127.0.0.1:8090
+
+# The head-to-head. Needs both services buildable and both libraries generated.
+compare: build
+    @echo "=== equivalence ===" && ./verify-equivalence.sh
+    @echo "\n=== rust ===" && ./target/release/bench --iterations 8
+    @echo "\n=== go ===" && cd ../golang-hedp && GOGC=400 go test ./internal/render/ \
+        -run '^$' -bench 'BenchmarkEngine/cached|BenchmarkBulkEngine/cached' -benchtime 8x -timeout 30m
+
+test:
+    cargo test --release
+
+clean:
+    cargo clean
